@@ -36,10 +36,6 @@ const DEFAULT_CODEX_COMMAND = 'npx';
 const DEFAULT_CODEX_ARGS = ['-y', 'codex', 'mcp-server'];
 const DEFAULT_CLIENT_SESSION_TIMEOUT_SECONDS = 360_000;
 
-function createConversationId(): string {
-  return `conv_${randomUUID().replace(/-/g, '')}`;
-}
-
 type NormalizedDeveloperDefinition = Required<DeveloperDefinition>;
 
 type WorkflowMode = 'full' | 'conversation';
@@ -762,7 +758,7 @@ export class WorkflowSession extends EventEmitter<WorkflowSessionEvents> {
     this.stopRequested = false;
     this.chatQueue = Promise.resolve();
     this.chatHistory = [];
-    this.chatConversationId = createConversationId();
+    this.chatConversationId = null;
     this.lastResponseId = undefined;
     this.activeTurnCount = 0;
     this.sessionDeferred = createDeferred<unknown>();
@@ -1017,6 +1013,7 @@ export class WorkflowSession extends EventEmitter<WorkflowSessionEvents> {
 
       this.chatHistory = result.history;
       this.lastResponseId = result.lastResponseId;
+      this.updateChatConversationId(result.rawResponses);
 
       this.emitAgentMessagesFromRunItems(result.newItems);
 
@@ -1032,6 +1029,31 @@ export class WorkflowSession extends EventEmitter<WorkflowSessionEvents> {
       this.activeTurnCount = Math.max(0, this.activeTurnCount - 1);
       if (!this.stopRequested && this.activeTurnCount === 0) {
         this.emitStatus('interactive', 'Awaiting further input');
+      }
+    }
+  }
+
+  private updateChatConversationId(rawResponses: Array<{ providerData?: Record<string, unknown> }>): void {
+    if (this.chatConversationId) {
+      return;
+    }
+    for (let index = rawResponses.length - 1; index >= 0; index -= 1) {
+      const providerData = rawResponses[index]?.providerData;
+      if (!providerData || typeof providerData !== 'object') {
+        continue;
+      }
+      const maybeConversation = (providerData as { conversation?: unknown }).conversation;
+      if (maybeConversation && typeof maybeConversation === 'object') {
+        const conversationId = (maybeConversation as { id?: unknown }).id;
+        if (typeof conversationId === 'string' && conversationId.startsWith('conv_')) {
+          this.chatConversationId = conversationId;
+          return;
+        }
+      }
+      const maybeId = (providerData as { conversation_id?: unknown }).conversation_id;
+      if (typeof maybeId === 'string' && maybeId.startsWith('conv_')) {
+        this.chatConversationId = maybeId;
+        return;
       }
     }
   }
