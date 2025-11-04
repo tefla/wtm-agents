@@ -1,4 +1,5 @@
 import { app, BrowserWindow, dialog, ipcMain } from 'electron';
+import { existsSync, readFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
 
 import {
@@ -25,6 +26,8 @@ import type {
   WorkflowConfigSummaryResponse,
   WorkflowIpcEvent,
 } from './shared/types';
+
+loadEnvironmentVariables();
 
 const DEFAULT_WINDOW_BOUNDS = {
   width: 1280,
@@ -59,6 +62,44 @@ const RUNTIME_DIR = typeof __dirname !== 'undefined' ? __dirname : process.cwd()
 
 let currentConfig: WorkflowConfig = createWorkflowConfig();
 let currentSummary: WorkflowConfigSummary = summarizeConfig(currentConfig);
+
+function loadEnvironmentVariables(): void {
+  try {
+    const envPath = join(process.cwd(), '.env');
+    if (!existsSync(envPath)) {
+      return;
+    }
+    const contents = readFileSync(envPath, 'utf8');
+    for (const rawLine of contents.split(/\r?\n/)) {
+      const line = rawLine.trim();
+      if (!line || line.startsWith('#')) {
+        continue;
+      }
+      const separatorIndex = line.indexOf('=');
+      if (separatorIndex === -1) {
+        continue;
+      }
+      const key = line.slice(0, separatorIndex).trim();
+      if (!key || process.env[key] !== undefined) {
+        continue;
+      }
+      const valuePart = line.slice(separatorIndex + 1).trim();
+      process.env[key] = stripQuotes(valuePart);
+    }
+  } catch (error) {
+    console.warn('Unable to load environment variables from .env', error);
+  }
+}
+
+function stripQuotes(value: string): string {
+  if (value.startsWith('"') && value.endsWith('"')) {
+    return value.slice(1, -1);
+  }
+  if (value.startsWith('\'') && value.endsWith('\'')) {
+    return value.slice(1, -1);
+  }
+  return value;
+}
 
 function sendToRenderer(event: WorkflowIpcEvent): void {
   if (!mainWindow) {
