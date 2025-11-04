@@ -1,7 +1,9 @@
 import { mkdirSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 
-import { Database } from 'bun:sqlite';
+import sqlite3 from 'sqlite3';
+
+sqlite3.verbose();
 
 export type RegistryOptions = {
   dbPath: string;
@@ -74,89 +76,101 @@ type WorktreeRow = {
 };
 
 export class CoordinatorRegistry {
-  private readonly db: Database;
+  private constructor(private readonly db: sqlite3.Database) {}
 
-  constructor(options: RegistryOptions) {
+  static async open(options: RegistryOptions): Promise<CoordinatorRegistry> {
     const dbPath = resolve(options.dbPath);
     mkdirSync(dirname(dbPath), { recursive: true });
-    this.db = new Database(dbPath);
-    this.db.run('PRAGMA foreign_keys = ON');
-    this.migrate();
+    const db = await openDatabase(dbPath);
+    const registry = new CoordinatorRegistry(db);
+    await registry.initialize();
+    return registry;
   }
 
-  close(): void {
-    this.db.close();
+  async close(): Promise<void> {
+    await closeDatabase(this.db);
   }
 
-  ensureProject(params: { name: string; repoRoot: string; defaultBranch: string }): ProjectRecord {
+  async ensureProject(params: {
+    name: string;
+    repoRoot: string;
+    defaultBranch: string;
+  }): Promise<ProjectRecord> {
     const now = new Date().toISOString();
-    this.db
-      .query(
-        `INSERT INTO projects (name, repo_root, default_branch, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?)
-         ON CONFLICT(name) DO UPDATE SET repo_root=excluded.repo_root, default_branch=excluded.default_branch, updated_at=excluded.updated_at`,
-      )
-      .run(params.name, params.repoRoot, params.defaultBranch, now, now);
+    await run(this.db, `
+      INSERT INTO projects (name, repo_root, default_branch, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(name) DO UPDATE SET
+        repo_root = excluded.repo_root,
+        default_branch = excluded.default_branch,
+        updated_at = excluded.updated_at
+    `, [params.name, params.repoRoot, params.defaultBranch, now, now]);
 
-    const projectStmt = this.db.query(`SELECT * FROM projects WHERE name = ?`);
-    const row = projectStmt.get(params.name) as ProjectRow | undefined;
+    const row = await get<ProjectRow>(this.db, `SELECT * FROM projects WHERE name = ?`, [
+      params.name,
+    ]);
     if (!row) {
       throw new Error(`Failed to load project '${params.name}' after upsert.`);
     }
     return mapProject(row);
   }
 
-  findProjectByName(name: string): ProjectRecord | undefined {
-    const projectStmt = this.db.query(`SELECT * FROM projects WHERE name = ?`);
-    const row = projectStmt.get(name) as ProjectRow | undefined;
+  async findProjectByName(name: string): Promise<ProjectRecord | undefined> {
+    const row = await get<ProjectRow>(this.db, `SELECT * FROM projects WHERE name = ?`, [name]);
     return row ? mapProject(row) : undefined;
   }
 
-  createTask(params: {
+  async createTask(params: {
     projectId: number;
     title: string;
     pmAgent: string;
     externalRef?: string;
     status?: string;
-  }): TaskRecord {
+  }): Promise<TaskRecord> {
     const now = new Date().toISOString();
     const status = params.status ?? 'active';
-    this.db
-      .query(
-        `INSERT INTO tasks (project_id, external_ref, title, pm_agent, status, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`
-      )
-      .run(params.projectId, params.externalRef ?? null, params.title, params.pmAgent, status, now, now);
+    await run(
+      this.db,
+      `INSERT INTO tasks (project_id, external_ref, title, pm_agent, status, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [
+        params.projectId,
+        params.externalRef ?? null,
+        params.title,
+        params.pmAgent,
+        status,
+        now,
+        now,
+      ],
+    );
 
-    const idRow = this.db.query('SELECT last_insert_rowid() AS id').get() as
-      | { id: number }
-      | undefined;
+    const idRow = await get<{ id: number }>(this.db, 'SELECT last_insert_rowid() AS id', []);
     const id = idRow?.id;
     if (typeof id !== 'number') {
       throw new Error('Failed to retrieve inserted task id.');
     }
-    const taskStmt = this.db.query(`SELECT * FROM tasks WHERE id = ?`);
-    const row = taskStmt.get(id) as TaskRow | undefined;
+    const row = await get<TaskRow>(this.db, `SELECT * FROM tasks WHERE id = ?`, [id]);
     if (!row) {
       throw new Error(`Inserted task ${id} could not be loaded.`);
     }
     return mapTask(row);
   }
 
-  updateTaskStatus(taskId: number, status: string): TaskRecord {
+  async updateTaskStatus(taskId: number, status: string): Promise<TaskRecord> {
     const now = new Date().toISOString();
-    this.db
-      .query(`UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?`)
-      .run(status, now, taskId);
-    const taskStmt = this.db.query(`SELECT * FROM tasks WHERE id = ?`);
-    const row = taskStmt.get(taskId) as TaskRow | undefined;
+    await run(this.db, `UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?`, [
+      status,
+      now,
+      taskId,
+    ]);
+    const row = await get<TaskRow>(this.db, `SELECT * FROM tasks WHERE id = ?`, [taskId]);
     if (!row) {
       throw new Error(`Task ${taskId} not found while updating status.`);
     }
     return mapTask(row);
   }
 
-  createWorktree(params: {
+  async createWorktree(params: {
     projectId: number;
     taskId: number;
     developerAgent: string;
@@ -164,15 +178,14 @@ export class CoordinatorRegistry {
     baseRef: string;
     path: string;
     status?: string;
-  }): WorktreeRecord {
+  }): Promise<WorktreeRecord> {
     const now = new Date().toISOString();
     const status = params.status ?? 'active';
-    this.db
-      .query(
-        `INSERT INTO worktrees (project_id, task_id, developer_agent, branch, base_ref, path, status, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
-      )
-      .run(
+    await run(
+      this.db,
+      `INSERT INTO worktrees (project_id, task_id, developer_agent, branch, base_ref, path, status, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
         params.projectId,
         params.taskId,
         params.developerAgent,
@@ -182,46 +195,51 @@ export class CoordinatorRegistry {
         status,
         now,
         now,
-      );
+      ],
+    );
 
-    const idRow = this.db.query('SELECT last_insert_rowid() AS id').get() as
-      | { id: number }
-      | undefined;
+    const idRow = await get<{ id: number }>(this.db, 'SELECT last_insert_rowid() AS id', []);
     const id = idRow?.id;
     if (typeof id !== 'number') {
       throw new Error('Failed to retrieve inserted worktree id.');
     }
-    const worktreeStmt = this.db.query(`SELECT * FROM worktrees WHERE id = ?`);
-    const row = worktreeStmt.get(id) as WorktreeRow | undefined;
+    const row = await get<WorktreeRow>(this.db, `SELECT * FROM worktrees WHERE id = ?`, [id]);
     if (!row) {
       throw new Error(`Inserted worktree ${id} could not be loaded.`);
     }
     return mapWorktree(row);
   }
 
-  updateWorktreeStatus(worktreeId: number, status: string): WorktreeRecord {
+  async updateWorktreeStatus(worktreeId: number, status: string): Promise<WorktreeRecord> {
     const now = new Date().toISOString();
-    this.db
-      .query(`UPDATE worktrees SET status = ?, updated_at = ? WHERE id = ?`)
-      .run(status, now, worktreeId);
-    const worktreeStmt = this.db.query(`SELECT * FROM worktrees WHERE id = ?`);
-    const row = worktreeStmt.get(worktreeId) as WorktreeRow | undefined;
+    await run(this.db, `UPDATE worktrees SET status = ?, updated_at = ? WHERE id = ?`, [
+      status,
+      now,
+      worktreeId,
+    ]);
+    const row = await get<WorktreeRow>(this.db, `SELECT * FROM worktrees WHERE id = ?`, [
+      worktreeId,
+    ]);
     if (!row) {
       throw new Error(`Worktree ${worktreeId} not found while updating status.`);
     }
     return mapWorktree(row);
   }
 
-  listActiveWorktrees(projectId: number): WorktreeRecord[] {
-    const worktreeStmt = this.db.query(
+  async listActiveWorktrees(projectId: number): Promise<WorktreeRecord[]> {
+    const rows = await all<WorktreeRow>(
+      this.db,
       `SELECT * FROM worktrees WHERE project_id = ? AND status = 'active'`,
+      [projectId],
     );
-    const rows = worktreeStmt.all(projectId) as WorktreeRow[];
     return rows.map(mapWorktree);
   }
 
-  private migrate(): void {
-    this.db.exec(`
+  private async initialize(): Promise<void> {
+    await exec(this.db, 'PRAGMA foreign_keys = ON');
+    await exec(
+      this.db,
+      `
       CREATE TABLE IF NOT EXISTS projects (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT NOT NULL UNIQUE,
@@ -255,8 +273,81 @@ export class CoordinatorRegistry {
         updated_at TEXT NOT NULL,
         UNIQUE(project_id, developer_agent, status) WHERE status = 'active'
       );
-    `);
+    `,
+    );
   }
+}
+
+function openDatabase(filePath: string): Promise<sqlite3.Database> {
+  return new Promise((resolve, reject) => {
+    const db = new sqlite3.Database(filePath, (error) => {
+      if (error) {
+        reject(error);
+      } else {
+        resolve(db);
+      }
+    });
+  });
+}
+
+function closeDatabase(db: sqlite3.Database): Promise<void> {
+  return new Promise((resolve, reject) => {
+    db.close((error) => {
+      if (error) {
+        reject(error);
+      } else {
+        resolve();
+      }
+    });
+  });
+}
+
+function exec(db: sqlite3.Database, sql: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    db.exec(sql, (error) => {
+      if (error) {
+        reject(error);
+      } else {
+        resolve();
+      }
+    });
+  });
+}
+
+function run(db: sqlite3.Database, sql: string, params: unknown[]): Promise<void> {
+  return new Promise((resolve, reject) => {
+    db.run(sql, params, (error) => {
+      if (error) {
+        reject(error);
+      } else {
+        resolve();
+      }
+    });
+  });
+}
+
+function get<T>(db: sqlite3.Database, sql: string, params: unknown[]): Promise<T | undefined> {
+  return new Promise((resolve, reject) => {
+    db.get(sql, params, (error, row) => {
+      if (error) {
+        reject(error);
+      } else {
+        resolve((row as T | undefined) ?? undefined);
+      }
+    });
+  });
+}
+
+function all<T>(db: sqlite3.Database, sql: string, params: unknown[]): Promise<T[]> {
+  return new Promise((resolve, reject) => {
+    db.all(sql, params, (error, rows) => {
+      if (error) {
+        reject(error);
+      } else {
+        resolve((rows as T[]) ?? []);
+      }
+    });
+  });
 }
 
 function mapProject(row: ProjectRow): ProjectRecord {

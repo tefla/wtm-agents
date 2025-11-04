@@ -111,7 +111,7 @@ export async function runWorkflow(
   config: WorkflowConfig,
   task?: string,
 ): Promise<unknown> {
-  const bootstrap = bootstrapWorkflow(config, task);
+  const bootstrap = await bootstrapWorkflow(config, task);
   const { resolved, registry, project, taskContext, developerContexts, prompt } = bootstrap;
 
   try {
@@ -148,7 +148,7 @@ export async function runWorkflow(
       await server.close();
     }
   } finally {
-    registry.close();
+    await registry.close();
   }
 }
 
@@ -156,23 +156,23 @@ export async function run(config: WorkflowConfig, task?: string): Promise<unknow
   return runWorkflow(config, task);
 }
 
-function bootstrapWorkflow(config: WorkflowConfig, task?: string): WorkflowBootstrap {
+async function bootstrapWorkflow(config: WorkflowConfig, task?: string): Promise<WorkflowBootstrap> {
   const resolved = resolveConfig(config);
   if (!existsSync(resolved.repoRoot)) {
     throw new Error(`Repository root does not exist: ${resolved.repoRoot}`);
   }
 
-  const registry = new CoordinatorRegistry({ dbPath: resolved.registryPath });
+  const registry = await CoordinatorRegistry.open({ dbPath: resolved.registryPath });
   try {
-    const project = registry.ensureProject({
+    const project = await registry.ensureProject({
       name: resolved.projectName,
       repoRoot: resolved.repoRoot,
       defaultBranch: resolved.defaultBranch,
     });
 
-    const taskRecord = createTaskRecord(registry, project, task ?? resolved.taskPrompt);
+    const taskRecord = await createTaskRecord(registry, project, task ?? resolved.taskPrompt);
     const taskContext: TaskContext = { id: taskRecord.id, title: taskRecord.title };
-    const developerContexts = prepareDevelopers(resolved, project, taskContext, registry);
+    const developerContexts = await prepareDevelopers(resolved, project, taskContext, registry);
     const prompt = composePrompt(taskContext.title, resolved, project, taskContext, developerContexts);
 
     return {
@@ -184,7 +184,7 @@ function bootstrapWorkflow(config: WorkflowConfig, task?: string): WorkflowBoots
       prompt,
     };
   } catch (error) {
-    registry.close();
+    await registry.close();
     throw error;
   }
 }
@@ -233,11 +233,11 @@ function buildDeveloperDefinitions(
   }));
 }
 
-function createTaskRecord(
+async function createTaskRecord(
   registry: CoordinatorRegistry,
   project: ProjectRecord,
   rawTitle: string,
-): TaskRecord {
+): Promise<TaskRecord> {
   const title = rawTitle.trim() || DEFAULT_TASK_PROMPT;
   return registry.createTask({
     projectId: project.id,
@@ -246,12 +246,12 @@ function createTaskRecord(
   });
 }
 
-function prepareDevelopers(
+async function prepareDevelopers(
   config: ResolvedWorkflowConfig,
   project: ProjectRecord,
   task: TaskContext,
   registry: CoordinatorRegistry,
-): DeveloperContext[] {
+): Promise<DeveloperContext[]> {
   const gitContext: GitContext = { repoRoot: config.repoRoot };
   const contexts: DeveloperContext[] = [];
   let worktrees = listWorktrees(gitContext);
@@ -285,7 +285,7 @@ function prepareDevelopers(
 
     worktrees = listWorktrees(gitContext);
 
-    const record = registry.createWorktree({
+    const record = await registry.createWorktree({
       projectId: project.id,
       taskId: task.id,
       developerAgent: definition.name,
@@ -561,7 +561,7 @@ export class WorkflowSession extends EventEmitter<WorkflowSessionEvents> {
     try {
       this.emitStatus('preparing', 'Preparing workflow configuration');
 
-      const bootstrap = bootstrapWorkflow(this.config, task);
+      const bootstrap = await bootstrapWorkflow(this.config, task);
       registry = bootstrap.registry;
       this.resolved = bootstrap.resolved;
       this.project = bootstrap.project;
@@ -572,7 +572,7 @@ export class WorkflowSession extends EventEmitter<WorkflowSessionEvents> {
       this.emitDevelopers(this.developerContexts);
       await this.setupFileWatchers(bootstrap.resolved, this.developerContexts);
 
-      registry.close();
+      await registry.close();
       registry = undefined;
 
       this.emitStatus('starting', 'Launching Codex MCP server');
@@ -636,7 +636,7 @@ export class WorkflowSession extends EventEmitter<WorkflowSessionEvents> {
       throw error;
     } finally {
       if (registry) {
-        registry.close();
+        await registry.close();
       }
       await this.teardownWatchers();
       this.runner = undefined;

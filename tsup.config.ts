@@ -15,7 +15,7 @@ export default defineConfig({
   shims: false,
   bundle: true,
   dts: false,
-  external: ['electron'],
+  external: ['electron', 'sqlite3'],
   env: {
     NODE_ENV: process.env.NODE_ENV ?? 'development',
   },
