@@ -1,21 +1,29 @@
 import { contextBridge, ipcRenderer } from 'electron';
 
 import type {
+  WorkflowChatSendResponse,
+  WorkflowChooseRepoResponse,
+  WorkflowClearRepoResponse,
+  WorkflowConfigSummary,
+  WorkflowConfigSummaryResponse,
   WorkflowIpcEvent,
-  WorkflowSelectDirectoryResponse,
-  WorkflowStartRequest,
-  WorkflowStartResponse,
-  WorkflowStopResponse,
 } from './shared/types';
 
 type WorkflowEventCallback = (event: WorkflowIpcEvent) => void;
 
 const api = {
-  startWorkflow: (request: WorkflowStartRequest): Promise<WorkflowStartResponse> =>
-    ipcRenderer.invoke('workflow:start', request),
-  stopWorkflow: (): Promise<WorkflowStopResponse> => ipcRenderer.invoke('workflow:stop'),
-  selectDirectory: (): Promise<WorkflowSelectDirectoryResponse> =>
-    ipcRenderer.invoke('workflow:select-directory'),
+  sendChatMessage: (message: string): Promise<WorkflowChatSendResponse> =>
+    ipcRenderer.invoke('workflow:chat-send', { message }),
+  chooseRepository: (): Promise<WorkflowChooseRepoResponse> =>
+    ipcRenderer.invoke('workflow:choose-repo'),
+  clearRepository: (): Promise<WorkflowClearRepoResponse> =>
+    ipcRenderer.invoke('workflow:clear-repo'),
+  getConfigSummary: async (): Promise<WorkflowConfigSummary> => {
+    const response: WorkflowConfigSummaryResponse = await ipcRenderer.invoke(
+      'workflow:get-config-summary',
+    );
+    return response.summary;
+  },
   onEvent: (callback: WorkflowEventCallback): (() => void) => {
     const handler = (_event: Electron.IpcRendererEvent, payload: WorkflowIpcEvent) => {
       callback(payload);

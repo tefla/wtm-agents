@@ -120,6 +120,15 @@ export class CoordinatorRegistry {
     return row ? mapProject(row) : undefined;
   }
 
+  async listProjects(): Promise<ProjectRecord[]> {
+    const rows = await all<ProjectRow>(
+      this.db,
+      'SELECT * FROM projects ORDER BY name COLLATE NOCASE ASC',
+      [],
+    );
+    return rows.map(mapProject);
+  }
+
   async createTask(params: {
     projectId: number;
     title: string;

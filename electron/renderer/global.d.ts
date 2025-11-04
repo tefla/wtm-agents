@@ -1,17 +1,18 @@
 import type {
+  WorkflowChatSendResponse,
+  WorkflowChooseRepoResponse,
+  WorkflowClearRepoResponse,
+  WorkflowConfigSummary,
   WorkflowIpcEvent,
-  WorkflowSelectDirectoryResponse,
-  WorkflowStartRequest,
-  WorkflowStartResponse,
-  WorkflowStopResponse,
 } from '../shared/types';
 
 declare global {
   interface Window {
     workflowApi?: {
-      startWorkflow(request: WorkflowStartRequest): Promise<WorkflowStartResponse>;
-      stopWorkflow(): Promise<WorkflowStopResponse>;
-      selectDirectory(): Promise<WorkflowSelectDirectoryResponse>;
+      sendChatMessage(message: string): Promise<WorkflowChatSendResponse>;
+      chooseRepository(): Promise<WorkflowChooseRepoResponse>;
+      clearRepository(): Promise<WorkflowClearRepoResponse>;
+      getConfigSummary(): Promise<WorkflowConfigSummary>;
       onEvent(callback: (event: WorkflowIpcEvent) => void): () => void;
       onceEvent(callback: (event: WorkflowIpcEvent) => void): void;
     };

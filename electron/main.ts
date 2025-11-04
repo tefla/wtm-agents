@@ -1,20 +1,29 @@
 import { app, BrowserWindow, dialog, ipcMain } from 'electron';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 
 import {
   WorkflowSession,
+  type WorkflowSessionChatMessage,
   type WorkflowSessionDeveloper,
   type WorkflowSessionErrorEvent,
   type WorkflowSessionFileEvent,
   type WorkflowSessionRunnerEvent,
   type WorkflowSessionStatusEvent,
 } from '../src/workflow';
+import {
+  DEFAULT_DEVELOPER_DESCRIPTION,
+  DEFAULT_MODEL,
+  type DeveloperDefinition,
+  type WorkflowConfig,
+} from '../src/types';
 import type {
+  WorkflowChatSendRequest,
+  WorkflowChatSendResponse,
+  WorkflowChooseRepoResponse,
+  WorkflowClearRepoResponse,
+  WorkflowConfigSummary,
+  WorkflowConfigSummaryResponse,
   WorkflowIpcEvent,
-  WorkflowSelectDirectoryResponse,
-  WorkflowStartRequest,
-  WorkflowStartResponse,
-  WorkflowStopResponse,
 } from './shared/types';
 
 const DEFAULT_WINDOW_BOUNDS = {
@@ -24,16 +33,42 @@ const DEFAULT_WINDOW_BOUNDS = {
   minHeight: 720,
 };
 
+const DEFAULT_DEVELOPERS: DeveloperDefinition[] = [
+  {
+    name: 'Chris',
+    description: DEFAULT_DEVELOPER_DESCRIPTION,
+    taskFileName: 'AGENT_TASKS.md',
+    statusFileName: 'STATUS.md',
+  },
+  {
+    name: 'Rimon',
+    description: DEFAULT_DEVELOPER_DESCRIPTION,
+    taskFileName: 'AGENT_TASKS.md',
+    statusFileName: 'STATUS.md',
+  },
+];
+
+const CONVERSATION_PROJECT_NAME = 'Unassigned Project';
+
 let mainWindow: BrowserWindow | null = null;
 let activeSession: WorkflowSession | null = null;
+let activeSessionPromise: Promise<unknown> | null = null;
 let detachSessionListeners: (() => void) | null = null;
+
 const RUNTIME_DIR = typeof __dirname !== 'undefined' ? __dirname : process.cwd();
+
+let currentConfig: WorkflowConfig = createWorkflowConfig();
+let currentSummary: WorkflowConfigSummary = summarizeConfig(currentConfig);
 
 function sendToRenderer(event: WorkflowIpcEvent): void {
   if (!mainWindow) {
     return;
   }
   mainWindow.webContents.send('workflow:event', event);
+}
+
+function broadcastConfigSummary(): void {
+  sendToRenderer({ type: 'config-summary', payload: currentSummary });
 }
 
 function bindSessionEvents(session: WorkflowSession): () => void {
@@ -43,17 +78,20 @@ function bindSessionEvents(session: WorkflowSession): () => void {
   const developerHandler = (developers: WorkflowSessionDeveloper[]) => {
     sendToRenderer({ type: 'developers', payload: developers });
   };
-  const fileHandler = (event: WorkflowSessionFileEvent) => {
-    sendToRenderer({ type: 'file-update', payload: event });
+  const fileHandler = (fileEvent: WorkflowSessionFileEvent) => {
+    sendToRenderer({ type: 'file-update', payload: fileEvent });
   };
-  const runnerHandler = (event: WorkflowSessionRunnerEvent) => {
-    sendToRenderer({ type: 'runner-event', payload: event });
+  const runnerHandler = (runnerEvent: WorkflowSessionRunnerEvent) => {
+    sendToRenderer({ type: 'runner-event', payload: runnerEvent });
   };
   const resultHandler = (result: unknown) => {
     sendToRenderer({ type: 'result', payload: result });
   };
   const errorHandler = (error: WorkflowSessionErrorEvent) => {
     sendToRenderer({ type: 'error', payload: error });
+  };
+  const chatHandler = (message: WorkflowSessionChatMessage) => {
+    sendToRenderer({ type: 'chat-message', payload: message });
   };
 
   session.on('session-status', statusHandler);
@@ -62,6 +100,7 @@ function bindSessionEvents(session: WorkflowSession): () => void {
   session.on('runner-event', runnerHandler);
   session.on('result', resultHandler);
   session.on('error', errorHandler);
+  session.on('chat-message', chatHandler);
 
   return () => {
     session.off('session-status', statusHandler);
@@ -70,6 +109,7 @@ function bindSessionEvents(session: WorkflowSession): () => void {
     session.off('runner-event', runnerHandler);
     session.off('result', resultHandler);
     session.off('error', errorHandler);
+    session.off('chat-message', chatHandler);
   };
 }
 
@@ -83,6 +123,7 @@ function clearActiveSession(): void {
   }
   detachSessionListeners = null;
   activeSession = null;
+  activeSessionPromise = null;
 }
 
 async function createWindow(): Promise<void> {
@@ -97,7 +138,7 @@ async function createWindow(): Promise<void> {
       contextIsolation: true,
       nodeIntegration: false,
     },
-    title: 'WTM Workflow Console',
+    title: 'BigBoss Console',
   });
 
   const rendererUrl = process.env.ELECTRON_RENDERER_URL;
@@ -117,56 +158,155 @@ async function createWindow(): Promise<void> {
   });
 }
 
-ipcMain.handle(
-  'workflow:start',
-  async (_event, request: WorkflowStartRequest): Promise<WorkflowStartResponse> => {
-    if (activeSession) {
-      throw new Error('A workflow session is already running.');
-    }
+function createWorkflowConfig(options: { repoRoot?: string | null; projectName?: string | null } = {}): WorkflowConfig {
+  const repoRoot = options.repoRoot?.trim() ?? '';
+  const projectName = options.projectName?.trim() || deriveProjectName(repoRoot) || CONVERSATION_PROJECT_NAME;
 
-    activeSession = new WorkflowSession(request.config);
-    detachSessionListeners = bindSessionEvents(activeSession);
+  return {
+    repoRoot,
+    projectName,
+    defaultBranch: 'main',
+    developers: DEFAULT_DEVELOPERS,
+    model: DEFAULT_MODEL,
+  };
+}
 
-    activeSession
-      .run(request.task)
-      .catch((error) => {
-        console.error('Workflow session failed', error);
-      })
-      .finally(() => {
-        clearActiveSession();
-      });
+function summarizeConfig(config: WorkflowConfig): WorkflowConfigSummary {
+  const repoRoot = config.repoRoot?.trim();
+  return {
+    mode: repoRoot ? 'full' : 'conversation',
+    projectName: config.projectName,
+    repoRoot: repoRoot || null,
+  };
+}
 
-    return { started: true };
-  },
-);
+function deriveProjectName(repoRoot: string | null | undefined): string | null {
+  if (!repoRoot) {
+    return null;
+  }
+  const trimmed = repoRoot.trim();
+  if (!trimmed) {
+    return null;
+  }
+  return basename(trimmed);
+}
 
-ipcMain.handle('workflow:stop', async (): Promise<WorkflowStopResponse> => {
+async function stopActiveSession(): Promise<void> {
   if (!activeSession) {
-    return { stopped: false };
+    return;
   }
-  await activeSession.stop();
-  return { stopped: true };
-});
 
-ipcMain.handle('workflow:select-directory', async (): Promise<WorkflowSelectDirectoryResponse> => {
-  if (!mainWindow) {
-    return { canceled: true };
+  try {
+    await activeSession.stop();
+  } catch (error) {
+    console.warn('Error stopping workflow session', error);
   }
+
+  if (activeSessionPromise) {
+    try {
+      await activeSessionPromise;
+    } catch (error) {
+      console.warn('Workflow session finished with error', error);
+    }
+  }
+}
+
+async function startWorkflowSession(config: WorkflowConfig): Promise<void> {
+  await stopActiveSession();
+
+  activeSession = new WorkflowSession(config);
+  detachSessionListeners = bindSessionEvents(activeSession);
+
+  activeSessionPromise = activeSession
+    .run()
+    .catch((error) => {
+      console.error('Workflow session failed', error);
+    })
+    .finally(() => {
+      clearActiveSession();
+    });
+}
+
+async function applyConfig(config: WorkflowConfig): Promise<void> {
+  currentConfig = config;
+  currentSummary = summarizeConfig(config);
+  broadcastConfigSummary();
+  await startWorkflowSession(config);
+}
+
+async function handleChooseRepository(): Promise<WorkflowChooseRepoResponse> {
+  if (!mainWindow) {
+    return { updated: false, summary: currentSummary };
+  }
+
   const result = await dialog.showOpenDialog(mainWindow, {
     properties: ['openDirectory', 'createDirectory'],
   });
+
   if (result.canceled || result.filePaths.length === 0) {
-    return { canceled: true };
+    return { updated: false, summary: currentSummary };
   }
-  return { canceled: false, path: result.filePaths[0] };
+
+  const repoRoot = result.filePaths[0];
+  const projectName = deriveProjectName(repoRoot) ?? CONVERSATION_PROJECT_NAME;
+  const config = createWorkflowConfig({ repoRoot, projectName });
+
+  try {
+    await applyConfig(config);
+    return { updated: true, summary: currentSummary };
+  } catch (error) {
+    console.error('Failed to apply repository config', error);
+    try {
+      await applyConfig(createWorkflowConfig());
+    } catch (recoveryError) {
+      console.error('Failed to recover conversation session', recoveryError);
+    }
+    return { updated: false, summary: currentSummary };
+  }
+}
+
+async function handleClearRepository(): Promise<WorkflowClearRepoResponse> {
+  await applyConfig(createWorkflowConfig());
+  return { summary: currentSummary };
+}
+
+ipcMain.handle(
+  'workflow:chat-send',
+  async (_event, request: WorkflowChatSendRequest): Promise<WorkflowChatSendResponse> => {
+    if (!activeSession) {
+      return { delivered: false, error: 'Workflow session is not ready.' };
+    }
+
+    try {
+      await activeSession.sendChatMessage(request?.message ?? '');
+      return { delivered: true };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return { delivered: false, error: message };
+    }
+  },
+);
+
+ipcMain.handle('workflow:get-config-summary', async (): Promise<WorkflowConfigSummaryResponse> => {
+  return { summary: currentSummary };
+});
+
+ipcMain.handle('workflow:choose-repo', async (): Promise<WorkflowChooseRepoResponse> => {
+  return handleChooseRepository();
+});
+
+ipcMain.handle('workflow:clear-repo', async (): Promise<WorkflowClearRepoResponse> => {
+  return handleClearRepository();
 });
 
 app.whenReady().then(async () => {
   await createWindow();
+  await applyConfig(currentConfig);
 
   app.on('activate', async () => {
     if (BrowserWindow.getAllWindows().length === 0) {
       await createWindow();
+      broadcastConfigSummary();
     }
   });
 });
@@ -178,11 +318,5 @@ app.on('window-all-closed', () => {
 });
 
 app.on('before-quit', async () => {
-  if (activeSession) {
-    try {
-      await activeSession.stop();
-    } catch (error) {
-      console.warn('Error while stopping workflow session during quit', error);
-    }
-  }
+  await stopActiveSession();
 });
