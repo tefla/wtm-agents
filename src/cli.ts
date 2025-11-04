@@ -1,26 +1,21 @@
 #!/usr/bin/env bun
 
+import { basename, resolve as resolvePath } from 'node:path';
+
 import yargs from 'yargs';
 import { hideBin } from 'yargs/helpers';
 
-import {
-  DEFAULT_DEVELOPER_DESCRIPTION,
-  DEFAULT_MODEL,
-  DeveloperDefinition,
-  WorkflowConfig,
-} from './types';
+import { DEFAULT_MODEL, WorkflowConfig } from './types';
 import { runWorkflow } from './workflow';
 
-const DEFAULT_DEVELOPER_COUNT = 2;
-const STDIN_FALLBACK_PROMPT =
-  'Coordinate the team to deliver the requested outcome.';
+const STDIN_FALLBACK_PROMPT = 'Coordinate the team to deliver the requested outcome.';
 
 type CliArguments = {
   task?: string;
   repo: string;
-  wtm?: string;
-  developer?: string[];
-  developerCount: number;
+  project?: string;
+  defaultBranch?: string;
+  registry?: string;
   model?: string;
   maxTurns?: number;
   json?: boolean;
@@ -28,56 +23,6 @@ type CliArguments = {
   codexArgs?: string[];
   clientSessionTimeoutSeconds?: number;
 };
-
-function parseDeveloperSpec(rawSpec: string): DeveloperDefinition {
-  const parts = rawSpec.split(',').map((chunk) => chunk.trim());
-  const entries = new Map<string, string>();
-  for (const part of parts) {
-    const [key, value] = part.split('=');
-    if (value === undefined) {
-      throw new Error(
-        `Invalid developer spec segment '${part}'. Expected key=value.`,
-      );
-    }
-    entries.set(key.trim().toLowerCase(), value.trim());
-  }
-
-  const name = entries.get('name');
-  const branch = entries.get('branch');
-  if (!name || !branch) {
-    throw new Error("Developer spec must include both 'name' and 'branch'.");
-  }
-
-  const description =
-    entries.get('description') ?? DEFAULT_DEVELOPER_DESCRIPTION;
-  const taskFileName = entries.get('task_file') ?? undefined;
-  const statusFileName = entries.get('status_file') ?? undefined;
-
-  return {
-    name,
-    branch,
-    description,
-    taskFileName,
-    statusFileName,
-  };
-}
-
-function resolveDevelopers(args: CliArguments): DeveloperDefinition[] {
-  if (args.developer && args.developer.length > 0) {
-    return args.developer.map((spec) => parseDeveloperSpec(spec));
-  }
-
-  const count = Math.max(1, args.developerCount ?? DEFAULT_DEVELOPER_COUNT);
-  const developers: DeveloperDefinition[] = [];
-  for (let index = 1; index <= count; index += 1) {
-    developers.push({
-      name: `Developer ${index}`,
-      branch: `agents/dev-${index}`,
-      description: DEFAULT_DEVELOPER_DESCRIPTION,
-    });
-  }
-  return developers;
-}
 
 async function readPrompt(defaultPrompt?: string): Promise<string> {
   if (defaultPrompt && defaultPrompt.trim()) {
@@ -114,23 +59,20 @@ async function main(): Promise<void> {
           .option('repo', {
             type: 'string',
             demandOption: true,
-            describe: 'Path to the repository root managed by wtm.',
+            describe: 'Path to the repository root for the active project.',
           })
-          .option('wtm', {
+          .option('project', {
             type: 'string',
-            describe: 'Path to the `wtm` binary.',
+            describe:
+              'Friendly project name registered with BigBoss (default: repo folder name).',
           })
-          .option('developer', {
+          .option('default-branch', {
             type: 'string',
-            array: true,
-            describe:
-              "Developer specification in the form 'name=Dev,branch=agents/dev[,description=...]'.",
+            describe: 'Branch used as the base for new task worktrees (default: main).',
           })
-          .option('developer-count', {
-            type: 'number',
-            default: DEFAULT_DEVELOPER_COUNT,
-            describe:
-              'Number of default developers when --developer is omitted (default: 2).',
+          .option('registry', {
+            type: 'string',
+            describe: 'Path to the BigBoss SQLite registry database.',
           })
           .option('model', {
             type: 'string',
@@ -153,8 +95,7 @@ async function main(): Promise<void> {
           .option('codex-arg', {
             type: 'string',
             array: true,
-            describe:
-              'Override the arguments passed to the Codex MCP command (repeatable).',
+            describe: 'Override the arguments passed to the Codex MCP command (repeatable).',
           })
           .option('client-session-timeout-seconds', {
             type: 'number',
@@ -169,9 +110,9 @@ async function main(): Promise<void> {
   const cliArgs: CliArguments = {
     task: argv.task as string | undefined,
     repo: argv.repo as string,
-    wtm: argv.wtm as string | undefined,
-    developer: (argv.developer as string[] | undefined) ?? undefined,
-    developerCount: argv['developer-count'] as number,
+    project: argv.project as string | undefined,
+    defaultBranch: argv['default-branch'] as string | undefined,
+    registry: argv.registry as string | undefined,
     model: argv.model as string | undefined,
     maxTurns: argv['max-turns'] as number | undefined,
     json: argv.json as boolean | undefined,
@@ -182,17 +123,19 @@ async function main(): Promise<void> {
   };
 
   const prompt = await readPrompt(cliArgs.task);
-  const developers = resolveDevelopers(cliArgs);
+  const projectName = cliArgs.project ?? basename(resolvePath(cliArgs.repo));
+  const defaultBranch = cliArgs.defaultBranch ?? 'main';
 
   const config: WorkflowConfig = {
     repoRoot: cliArgs.repo,
-    developers,
+    projectName,
+    defaultBranch,
     model: cliArgs.model,
-    wtmBinary: cliArgs.wtm,
     maxTurns: cliArgs.maxTurns,
     codexCommand: cliArgs.codexCommand,
     codexArgs: cliArgs.codexArgs,
     clientSessionTimeoutSeconds: cliArgs.clientSessionTimeoutSeconds,
+    registryPath: cliArgs.registry,
   };
 
   try {

@@ -1,31 +1,40 @@
 export const DEFAULT_MODEL = 'gpt-4.1-mini';
 
 export const DEFAULT_DEVELOPER_DESCRIPTION =
-  'Generalist product engineer capable of shipping features end-to-end.';
+  'Product-minded engineer who ships production-ready changes with minimal guidance.';
+
+export const BIGBOSS_NAME = 'BigBoss';
+export const PM_NAME = 'Anup';
 
 export type DeveloperDefinition = {
   name: string;
-  branch: string;
   description?: string;
   taskFileName?: string;
   statusFileName?: string;
 };
 
 export type DeveloperContext = {
-  definition: DeveloperDefinition;
+  definition: Required<DeveloperDefinition>;
   branch: string;
   worktreePath: string;
+  worktreeRecordId: number;
   taskFile: string;
   statusFile: string;
   handoffToken: string;
 };
 
+export type TaskContext = {
+  id: number;
+  title: string;
+};
+
 export type WorkflowConfig = {
   repoRoot: string;
-  developers: DeveloperDefinition[];
+  projectName: string;
+  defaultBranch: string;
   model?: string;
   taskPrompt?: string;
-  wtmBinary?: string;
+  registryPath?: string;
   codexCommand?: string;
   codexArgs?: string[];
   clientSessionTimeoutSeconds?: number;
