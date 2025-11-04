@@ -120,6 +120,15 @@ export class CoordinatorRegistry {
     return row ? mapProject(row) : undefined;
   }
 
+  async listProjects(): Promise<ProjectRecord[]> {
+    const rows = await all<ProjectRow>(
+      this.db,
+      'SELECT * FROM projects ORDER BY name COLLATE NOCASE ASC',
+      [],
+    );
+    return rows.map(mapProject);
+  }
+
   async createTask(params: {
     projectId: number;
     title: string;
@@ -270,9 +279,11 @@ export class CoordinatorRegistry {
         path TEXT NOT NULL,
         status TEXT NOT NULL,
         created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL,
-        UNIQUE(project_id, developer_agent, status) WHERE status = 'active'
+        updated_at TEXT NOT NULL
       );
+      CREATE UNIQUE INDEX IF NOT EXISTS worktrees_active_unique
+        ON worktrees(project_id, developer_agent)
+        WHERE status = 'active';
     `,
     );
   }

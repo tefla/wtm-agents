@@ -1,8 +1,5 @@
 import type {
-  WorkflowConfig,
-  DeveloperDefinition,
-} from '../../src/types';
-import type {
+  WorkflowSessionChatMessage,
   WorkflowSessionDeveloper,
   WorkflowSessionErrorEvent,
   WorkflowSessionFileEvent,
@@ -10,12 +7,13 @@ import type {
   WorkflowSessionStatusEvent,
 } from '../../src/workflow';
 
-export type WorkflowStartRequest = {
-  config: WorkflowConfig;
-  task?: string;
-};
-
 export type WorkflowUpdateDevelopers = WorkflowSessionDeveloper[];
+
+export type WorkflowConfigSummary = {
+  mode: 'conversation' | 'full';
+  projectName: string;
+  repoRoot?: string | null;
+};
 
 export type WorkflowIpcEvent =
   | { type: 'session-status'; payload: WorkflowSessionStatusEvent }
@@ -23,22 +21,30 @@ export type WorkflowIpcEvent =
   | { type: 'file-update'; payload: WorkflowSessionFileEvent }
   | { type: 'runner-event'; payload: WorkflowSessionRunnerEvent }
   | { type: 'result'; payload: unknown }
+  | { type: 'chat-message'; payload: WorkflowSessionChatMessage }
+  | { type: 'config-summary'; payload: WorkflowConfigSummary }
   | { type: 'error'; payload: WorkflowSessionErrorEvent };
 
-export type WorkflowStopResponse = {
-  stopped: boolean;
+export type WorkflowChatSendRequest = {
+  message: string;
 };
 
-export type WorkflowStartResponse = {
-  started: boolean;
+export type WorkflowChatSendResponse = {
+  delivered: boolean;
+  error?: string;
 };
 
-export type WorkflowSelectDirectoryResponse = {
-  canceled: boolean;
-  path?: string;
+export type WorkflowChatMessage = WorkflowSessionChatMessage;
+
+export type WorkflowChooseRepoResponse = {
+  updated: boolean;
+  summary: WorkflowConfigSummary;
 };
 
-export type DeveloperFormDefinition = Pick<
-  DeveloperDefinition,
-  'name' | 'description' | 'taskFileName' | 'statusFileName'
->;
+export type WorkflowClearRepoResponse = {
+  summary: WorkflowConfigSummary;
+};
+
+export type WorkflowConfigSummaryResponse = {
+  summary: WorkflowConfigSummary;
+};
