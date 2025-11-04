@@ -1,3 +1,4 @@
+import { spawnSync as nodeSpawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 
@@ -31,17 +32,48 @@ export type WorktreeInfo = {
 
 export function runWtmCommand(context: WtmContext, args: string[]): string {
   const command = [context.wtmBinary, ...args];
-  const result = Bun.spawnSync(command, {
+  const bunAvailable = typeof Bun !== 'undefined' && typeof Bun.spawnSync === 'function';
+
+  if (bunAvailable) {
+    const result = Bun.spawnSync(command, {
+      cwd: context.repoRoot,
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+
+    const stdout = result.stdout?.toString() ?? '';
+    const stderr = result.stderr?.toString() ?? '';
+    const exitCode = result.exitCode ?? -1;
+
+    if (exitCode !== 0) {
+      throw new WTMCommandError(command, exitCode, stdout, stderr);
+    }
+
+    return stdout.trim();
+  }
+
+  const result = nodeSpawnSync(command[0] as string, command.slice(1), {
     cwd: context.repoRoot,
-    stdout: 'pipe',
-    stderr: 'pipe',
+    encoding: 'utf8',
   });
 
-  const stdout = result.stdout?.toString() ?? '';
-  const stderr = result.stderr?.toString() ?? '';
+  const stdout =
+    typeof result.stdout === 'string'
+      ? result.stdout
+      : ((result.stdout as Buffer | undefined)?.toString('utf8') ?? '');
+  const stderr =
+    typeof result.stderr === 'string'
+      ? result.stderr
+      : ((result.stderr as Buffer | undefined)?.toString('utf8') ?? '');
+  const exitCode =
+    typeof result.status === 'number'
+      ? result.status
+      : result.signal
+        ? 1
+        : -1;
 
-  if (result.exitCode !== 0) {
-    throw new WTMCommandError(command, result.exitCode ?? -1, stdout, stderr);
+  if (exitCode !== 0) {
+    throw new WTMCommandError(command, exitCode, stdout, stderr);
   }
 
   return stdout.trim();

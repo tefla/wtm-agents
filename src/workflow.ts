@@ -1,5 +1,9 @@
 import { existsSync } from 'node:fs';
+import { readFile } from 'node:fs/promises';
+import { EventEmitter } from 'node:events';
 import { resolve, join } from 'node:path';
+
+import chokidar, { FSWatcher } from 'chokidar';
 
 import { Agent, MCPServerStdio, Runner } from '@openai/agents';
 
@@ -45,40 +49,69 @@ type NormalizedDeveloperDefinition = Required<
     statusFileName: string;
   };
 
+export type WorkflowSessionStage =
+  | 'preparing'
+  | 'starting'
+  | 'running'
+  | 'completed'
+  | 'failed'
+  | 'cancelled';
+
+export type WorkflowSessionStatusEvent = {
+  stage: WorkflowSessionStage;
+  message?: string;
+  timestamp: string;
+};
+
+export type WorkflowSessionDeveloper = {
+  name: string;
+  description: string;
+  branch: string;
+  worktreePath: string;
+  taskFile: string;
+  statusFile: string;
+  handoffToken: string;
+};
+
+export type WorkflowSessionFileKind = 'task' | 'status' | 'overview' | 'team';
+
+export type WorkflowSessionFileEvent = {
+  kind: WorkflowSessionFileKind;
+  path: string;
+  developerName?: string;
+  content: string | null;
+  timestamp: string;
+};
+
+export type WorkflowSessionRunnerEvent = {
+  event: unknown;
+  timestamp: string;
+};
+
+export type WorkflowSessionErrorEvent = {
+  message: string;
+  name?: string;
+  stack?: string;
+  scope?: string;
+  path?: string;
+  timestamp: string;
+};
+
+type WorkflowSessionEvents = {
+  'session-status': [WorkflowSessionStatusEvent];
+  developers: [WorkflowSessionDeveloper[]];
+  'file-update': [WorkflowSessionFileEvent];
+  'runner-event': [WorkflowSessionRunnerEvent];
+  result: [unknown];
+  error: [WorkflowSessionErrorEvent];
+};
+
 export async function runWorkflow(
   config: WorkflowConfig,
   task?: string,
 ): Promise<unknown> {
-  const resolved = resolveConfig(config);
-  if (!resolved.developers.length) {
-    throw new Error('At least one developer must be configured.');
-  }
-
-  const developerContexts = prepareDevelopers(resolved);
-  const prompt = composePrompt(task ?? resolved.taskPrompt, resolved, developerContexts);
-
-  const server = new MCPServerStdio({
-    command: resolved.codexCommand,
-    args: resolved.codexArgs,
-    cwd: resolved.repoRoot,
-    clientSessionTimeoutSeconds: resolved.clientSessionTimeoutSeconds,
-  });
-
-  await server.connect();
-  try {
-    const { projectManager, developerAgents } = buildAgents(server, resolved, developerContexts);
-    const runner = new Runner();
-    const result = await runner.run(projectManager, prompt, {
-      maxTurns: resolved.maxTurns,
-    });
-    // Reconnect developers with manager after run in case runner mutated state.
-    for (const developer of developerAgents) {
-      developer.handoffs = [projectManager];
-    }
-    return result;
-  } finally {
-    await server.close();
-  }
+  const session = new WorkflowSession(config);
+  return session.run(task);
 }
 
 export async function run(config: WorkflowConfig, task?: string): Promise<unknown> {
@@ -247,4 +280,379 @@ function composePrompt(
     `${roster}\n` +
     'The Project Manager coordinates the developers above. Ensure each workstream stays in its dedicated worktree.'
   );
+}
+
+type WatchedFileMeta = {
+  path: string;
+  kind: WorkflowSessionFileKind;
+  developerName?: string;
+};
+
+function normalizeError(
+  error: unknown,
+  context: { scope?: string; path?: string } = {},
+): WorkflowSessionErrorEvent {
+  if (error instanceof Error) {
+    return {
+      message: error.message,
+      name: error.name,
+      stack: error.stack,
+      scope: context.scope,
+      path: context.path,
+      timestamp: new Date().toISOString(),
+    };
+  }
+
+  return {
+    message: String(error),
+    scope: context.scope,
+    path: context.path,
+    timestamp: new Date().toISOString(),
+  };
+}
+
+export class WorkflowSession extends EventEmitter<WorkflowSessionEvents> {
+  private readonly config: WorkflowConfig;
+  private resolved?: ResolvedWorkflowConfig;
+  private server?: MCPServerStdio;
+  private runner?: Runner;
+  private developerContexts: DeveloperContext[] = [];
+  private watchers: FSWatcher[] = [];
+  private runnerCleanup?: () => void;
+  private running = false;
+  private stopRequested = false;
+
+  constructor(config: WorkflowConfig) {
+    super();
+    this.config = config;
+  }
+
+  isRunning(): boolean {
+    return this.running;
+  }
+
+  getDevelopers(): WorkflowSessionDeveloper[] {
+    return this.developerContexts.map((ctx) => ({
+      name: ctx.definition.name,
+      description: ctx.definition.description ?? DEFAULT_DEVELOPER_DESCRIPTION,
+      branch: ctx.branch,
+      worktreePath: ctx.worktreePath,
+      taskFile: ctx.taskFile,
+      statusFile: ctx.statusFile,
+      handoffToken: ctx.handoffToken,
+    }));
+  }
+
+  async run(task?: string): Promise<unknown> {
+    if (this.running) {
+      throw new Error('Workflow session is already running.');
+    }
+
+    this.running = true;
+    this.stopRequested = false;
+
+    try {
+      this.emitStatus('preparing', 'Preparing workflow configuration');
+
+      const resolved = resolveConfig(this.config);
+      if (!resolved.developers.length) {
+        throw new Error('At least one developer must be configured.');
+      }
+      this.resolved = resolved;
+
+      const contexts = prepareDevelopers(resolved);
+      this.developerContexts = contexts;
+      this.emitDevelopers(contexts);
+      await this.setupFileWatchers(resolved, contexts);
+
+      const prompt = composePrompt(task ?? resolved.taskPrompt, resolved, contexts);
+
+      this.emitStatus('starting', 'Launching Codex MCP server');
+
+      this.server = new MCPServerStdio({
+        command: resolved.codexCommand,
+        args: resolved.codexArgs,
+        cwd: resolved.repoRoot,
+        clientSessionTimeoutSeconds: resolved.clientSessionTimeoutSeconds,
+      });
+
+      await this.server.connect();
+
+      try {
+        const { projectManager, developerAgents } = buildAgents(
+          this.server,
+          resolved,
+          contexts,
+        );
+
+        this.runner = new Runner();
+        this.attachRunnerListeners(this.runner);
+
+        this.emitStatus('running', 'Workflow running');
+
+        const result = await this.runner.run(projectManager, prompt, {
+          maxTurns: resolved.maxTurns,
+        });
+
+        for (const developer of developerAgents) {
+          developer.handoffs = [projectManager];
+        }
+
+        this.emit('result', result);
+        const finalStage: WorkflowSessionStage = this.stopRequested ? 'cancelled' : 'completed';
+        this.emitStatus(
+          finalStage,
+          finalStage === 'completed' ? 'Workflow completed successfully' : 'Workflow cancelled',
+        );
+        return result;
+      } finally {
+        this.detachRunnerListeners();
+        if (this.server) {
+          try {
+            await this.server.close();
+          } catch (error) {
+            this.emit('error', normalizeError(error, { scope: 'session' }));
+          } finally {
+            this.server = undefined;
+          }
+        }
+      }
+    } catch (error) {
+      const normalized = normalizeError(error, { scope: 'session' });
+      this.emit('error', normalized);
+      this.emitStatus('failed', normalized.message);
+      throw error;
+    } finally {
+      await this.teardownWatchers();
+      this.runner = undefined;
+      this.running = false;
+    }
+  }
+
+  async stop(): Promise<void> {
+    this.stopRequested = true;
+    const runner = this.runner as unknown as {
+      abort?: () => unknown;
+      stop?: () => unknown;
+      terminate?: () => unknown;
+    };
+
+    const methods: (keyof typeof runner)[] = ['abort', 'stop', 'terminate'];
+    for (const method of methods) {
+      const fn = runner?.[method];
+      if (typeof fn === 'function') {
+        try {
+          const result = fn.call(runner);
+          if (result instanceof Promise) {
+            await result;
+          }
+        } catch (error) {
+          this.emit('error', normalizeError(error, { scope: 'runner' }));
+        }
+        break;
+      }
+    }
+  }
+
+  private emitStatus(stage: WorkflowSessionStage, message?: string): void {
+    this.emit('session-status', {
+      stage,
+      message,
+      timestamp: new Date().toISOString(),
+    });
+  }
+
+  private emitDevelopers(contexts: DeveloperContext[]): void {
+    this.emit(
+      'developers',
+      contexts.map((ctx) => ({
+        name: ctx.definition.name,
+        description: ctx.definition.description ?? DEFAULT_DEVELOPER_DESCRIPTION,
+        branch: ctx.branch,
+        worktreePath: ctx.worktreePath,
+        taskFile: ctx.taskFile,
+        statusFile: ctx.statusFile,
+        handoffToken: ctx.handoffToken,
+      })),
+    );
+  }
+
+  private async setupFileWatchers(
+    config: ResolvedWorkflowConfig,
+    contexts: DeveloperContext[],
+  ): Promise<void> {
+    const metas: WatchedFileMeta[] = [];
+
+    for (const context of contexts) {
+      metas.push({
+        path: context.taskFile,
+        kind: 'task',
+        developerName: context.definition.name,
+      });
+      metas.push({
+        path: context.statusFile,
+        kind: 'status',
+        developerName: context.definition.name,
+      });
+    }
+
+    metas.push({
+      path: join(config.repoRoot, 'PROJECT_OVERVIEW.md'),
+      kind: 'overview',
+    });
+    metas.push({
+      path: join(config.repoRoot, 'TEAM_STATUS.md'),
+      kind: 'team',
+    });
+
+    const watchers = await Promise.all(
+      metas.map(async (meta) => this.createWatcher(meta)),
+    );
+    this.watchers = watchers.filter((watcher): watcher is FSWatcher => Boolean(watcher));
+  }
+
+  private async createWatcher(meta: WatchedFileMeta): Promise<FSWatcher | undefined> {
+    try {
+      const watcher = chokidar.watch(meta.path, {
+        ignoreInitial: false,
+        awaitWriteFinish: {
+          stabilityThreshold: 100,
+          pollInterval: 50,
+        },
+      });
+
+      watcher.on('add', () => {
+        void this.emitFileSnapshot(meta, true);
+      });
+      watcher.on('change', () => {
+        void this.emitFileSnapshot(meta, true);
+      });
+      watcher.on('unlink', () => {
+        void this.emitFileSnapshot(meta, false);
+      });
+      watcher.on('error', (watchError) => {
+        this.emit('error', normalizeError(watchError, { scope: 'watcher', path: meta.path }));
+      });
+
+      await new Promise<void>((resolve) => {
+        let resolved = false;
+        const finish = () => {
+          if (!resolved) {
+            resolved = true;
+            resolve();
+          }
+        };
+        watcher.once('ready', finish);
+        watcher.once('error', finish);
+      });
+
+      return watcher;
+    } catch (error) {
+      this.emit('error', normalizeError(error, { scope: 'watcher', path: meta.path }));
+      return undefined;
+    }
+  }
+
+  private async emitFileSnapshot(meta: WatchedFileMeta, exists: boolean): Promise<void> {
+    if (!exists) {
+      this.emit('file-update', {
+        kind: meta.kind,
+        path: meta.path,
+        developerName: meta.developerName,
+        content: null,
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    try {
+      const content = await readFile(meta.path, 'utf8');
+      this.emit('file-update', {
+        kind: meta.kind,
+        path: meta.path,
+        developerName: meta.developerName,
+        content,
+        timestamp: new Date().toISOString(),
+      });
+    } catch (error) {
+      this.emit('error', normalizeError(error, { scope: 'watcher', path: meta.path }));
+    }
+  }
+
+  private async teardownWatchers(): Promise<void> {
+    if (!this.watchers.length) {
+      return;
+    }
+
+    await Promise.all(
+      this.watchers.map(async (watcher) => {
+        try {
+          await watcher.close();
+        } catch (error) {
+          this.emit('error', normalizeError(error, { scope: 'watcher' }));
+        }
+      }),
+    );
+
+    this.watchers = [];
+  }
+
+  private attachRunnerListeners(runner: Runner): void {
+    const candidate = runner as unknown as Partial<EventEmitter> & {
+      subscribe?: (listener: (event: unknown) => void) => (() => void) | void;
+      removeListener?: (eventName: string, listener: (...args: unknown[]) => void) => void;
+    };
+
+    if (typeof candidate.on === 'function') {
+      const handler = (event: unknown) => {
+        this.emit('runner-event', {
+          event,
+          timestamp: new Date().toISOString(),
+        });
+      };
+
+      candidate.on('event' as unknown as string, handler);
+      this.runnerCleanup = () => {
+        if (typeof candidate.off === 'function') {
+          candidate.off('event' as unknown as string, handler);
+        } else if (typeof candidate.removeListener === 'function') {
+          candidate.removeListener('event' as unknown as string, handler);
+        }
+      };
+      return;
+    }
+
+    if (typeof candidate.subscribe === 'function') {
+      const unsubscribe = candidate.subscribe((event) => {
+        this.emit('runner-event', {
+          event,
+          timestamp: new Date().toISOString(),
+        });
+      });
+
+      if (typeof unsubscribe === 'function') {
+        this.runnerCleanup = () => {
+          try {
+            unsubscribe();
+          } catch (error) {
+            this.emit('error', normalizeError(error, { scope: 'runner' }));
+          }
+        };
+      }
+    }
+  }
+
+  private detachRunnerListeners(): void {
+    if (!this.runnerCleanup) {
+      return;
+    }
+
+    try {
+      this.runnerCleanup();
+    } catch (error) {
+      this.emit('error', normalizeError(error, { scope: 'runner' }));
+    } finally {
+      this.runnerCleanup = undefined;
+    }
+  }
 }
