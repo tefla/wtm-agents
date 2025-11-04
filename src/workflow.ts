@@ -1,6 +1,9 @@
 import { existsSync, mkdirSync } from 'node:fs';
+import { readFile } from 'node:fs/promises';
+import { EventEmitter } from 'node:events';
 import { dirname, join, resolve } from 'node:path';
 
+import chokidar, { FSWatcher } from 'chokidar';
 import { Agent, MCPServerStdio, Runner } from '@openai/agents';
 
 import {
@@ -38,29 +41,80 @@ export type ResolvedWorkflowConfig = {
   maxTurns?: number;
 };
 
+type WorkflowBootstrap = {
+  resolved: ResolvedWorkflowConfig;
+  registry: CoordinatorRegistry;
+  project: ProjectRecord;
+  taskContext: TaskContext;
+  developerContexts: DeveloperContext[];
+  prompt: string;
+};
+
+export type WorkflowSessionStage =
+  | 'preparing'
+  | 'starting'
+  | 'running'
+  | 'completed'
+  | 'failed'
+  | 'cancelled';
+
+export type WorkflowSessionStatusEvent = {
+  stage: WorkflowSessionStage;
+  message?: string;
+  timestamp: string;
+};
+
+export type WorkflowSessionDeveloper = {
+  name: string;
+  description: string;
+  branch: string;
+  worktreePath: string;
+  taskFile: string;
+  statusFile: string;
+  handoffToken: string;
+};
+
+export type WorkflowSessionFileKind = 'task' | 'status' | 'overview' | 'team';
+
+export type WorkflowSessionFileEvent = {
+  kind: WorkflowSessionFileKind;
+  path: string;
+  developerName?: string;
+  content: string | null;
+  timestamp: string;
+};
+
+export type WorkflowSessionRunnerEvent = {
+  event: unknown;
+  timestamp: string;
+};
+
+export type WorkflowSessionErrorEvent = {
+  message: string;
+  name?: string;
+  stack?: string;
+  scope?: string;
+  path?: string;
+  timestamp: string;
+};
+
+type WorkflowSessionEvents = {
+  'session-status': [WorkflowSessionStatusEvent];
+  developers: [WorkflowSessionDeveloper[]];
+  'file-update': [WorkflowSessionFileEvent];
+  'runner-event': [WorkflowSessionRunnerEvent];
+  result: [unknown];
+  error: [WorkflowSessionErrorEvent];
+};
+
 export async function runWorkflow(
   config: WorkflowConfig,
   task?: string,
 ): Promise<unknown> {
-  const resolved = resolveConfig(config);
-  if (!existsSync(resolved.repoRoot)) {
-    throw new Error(`Repository root does not exist: ${resolved.repoRoot}`);
-  }
+  const bootstrap = bootstrapWorkflow(config, task);
+  const { resolved, registry, project, taskContext, developerContexts, prompt } = bootstrap;
 
-  const registry = new CoordinatorRegistry({ dbPath: resolved.registryPath });
   try {
-    const project = registry.ensureProject({
-      name: resolved.projectName,
-      repoRoot: resolved.repoRoot,
-      defaultBranch: resolved.defaultBranch,
-    });
-
-    const taskRecord = createTaskRecord(registry, project, task ?? resolved.taskPrompt);
-    const taskContext: TaskContext = { id: taskRecord.id, title: taskRecord.title };
-
-    const developerContexts = prepareDevelopers(resolved, project, taskContext, registry);
-    const prompt = composePrompt(taskRecord.title, resolved, project, taskContext, developerContexts);
-
     const server = new MCPServerStdio({
       command: resolved.codexCommand,
       args: resolved.codexArgs,
@@ -77,6 +131,7 @@ export async function runWorkflow(
         taskContext,
         developerContexts,
       );
+
       const runner = new Runner();
       const result = await runner.run(bigBoss, prompt, {
         maxTurns: resolved.maxTurns,
@@ -101,13 +156,46 @@ export async function run(config: WorkflowConfig, task?: string): Promise<unknow
   return runWorkflow(config, task);
 }
 
+function bootstrapWorkflow(config: WorkflowConfig, task?: string): WorkflowBootstrap {
+  const resolved = resolveConfig(config);
+  if (!existsSync(resolved.repoRoot)) {
+    throw new Error(`Repository root does not exist: ${resolved.repoRoot}`);
+  }
+
+  const registry = new CoordinatorRegistry({ dbPath: resolved.registryPath });
+  try {
+    const project = registry.ensureProject({
+      name: resolved.projectName,
+      repoRoot: resolved.repoRoot,
+      defaultBranch: resolved.defaultBranch,
+    });
+
+    const taskRecord = createTaskRecord(registry, project, task ?? resolved.taskPrompt);
+    const taskContext: TaskContext = { id: taskRecord.id, title: taskRecord.title };
+    const developerContexts = prepareDevelopers(resolved, project, taskContext, registry);
+    const prompt = composePrompt(taskContext.title, resolved, project, taskContext, developerContexts);
+
+    return {
+      resolved,
+      registry,
+      project,
+      taskContext,
+      developerContexts,
+      prompt,
+    };
+  } catch (error) {
+    registry.close();
+    throw error;
+  }
+}
+
 function resolveConfig(config: WorkflowConfig): ResolvedWorkflowConfig {
   const repoRoot = resolve(config.repoRoot);
   return {
     repoRoot,
     projectName: config.projectName,
     defaultBranch: config.defaultBranch,
-    developers: buildDeveloperDefinitions(),
+    developers: buildDeveloperDefinitions(config.developers),
     model: config.model ?? DEFAULT_MODEL,
     taskPrompt: config.taskPrompt ?? DEFAULT_TASK_PROMPT,
     registryPath: resolveRegistryPath(config.registryPath, repoRoot),
@@ -128,13 +216,17 @@ function resolveRegistryPath(customPath: string | undefined, repoRoot: string): 
   return resolve(base, '.agent_hub', 'bigboss.db');
 }
 
-function buildDeveloperDefinitions(): NormalizedDeveloperDefinition[] {
+function buildDeveloperDefinitions(
+  provided?: DeveloperDefinition[],
+): NormalizedDeveloperDefinition[] {
   const defaults: DeveloperDefinition[] = [
     { name: 'Chris', description: DEFAULT_DEVELOPER_DESCRIPTION },
     { name: 'Rimon', description: DEFAULT_DEVELOPER_DESCRIPTION },
   ];
-  return defaults.map((definition) => ({
-    name: definition.name,
+
+  const source = provided && provided.length ? provided : defaults;
+  return source.map((definition, index) => ({
+    name: definition.name?.trim() || `Developer ${index + 1}`,
     description: definition.description ?? DEFAULT_DEVELOPER_DESCRIPTION,
     taskFileName: definition.taskFileName ?? 'AGENT_TASKS.md',
     statusFileName: definition.statusFileName ?? 'STATUS.md',
@@ -353,19 +445,18 @@ function buildDeveloperInstructions(
   return `You are ${ctx.definition.name}, a ${ctx.definition.description}
 - Project: ${project.name}
 - Task #${task.id}: ${task.title}
-- Assigned branch: \\`${ctx.branch}\\`
-- Worktree path: \\`${ctx.worktreePath}\\`
-- Task list: \\`${ctx.taskFile}\\`
-- Status log: \\`${ctx.statusFile}\\`
+- Assigned branch: \`${ctx.branch}\`
+- Worktree path: \`${ctx.worktreePath}\`
+- Task list: \`${ctx.taskFile}\`
+- Status log: \`${ctx.statusFile}\`
 - Registry record id: ${ctx.worktreeRecordId}
 
 Responsibilities:
 1. Operate exclusively within your worktree; do not touch other branches or the main repo root.
 2. Upkeep your task list before and after coding; capture assumptions, TODOs, and scope changes.
 3. Log progress and blockers in your status file so ${PM_NAME} can summarize accurately.
-4. Use Codex MCP for edits and commands with sandbox workspace-write / approval-policy never, `cwd` set to your worktree.
-5. When ready to hand back, summarise the changes, note any follow-ups, and hand off using \\`${ctx.handoffToken}\\`.`;
-
+4. Use Codex MCP for edits and commands with sandbox workspace-write / approval-policy never, set \`cwd\` to your worktree.
+5. When ready to hand back, summarise the changes, note any follow-ups, and hand off using \`${ctx.handoffToken}\`.`;
 }
 
 function composePrompt(
@@ -391,4 +482,390 @@ function composePrompt(
     developerSummary +
     '\n\nBigBoss is the sole user-facing agent; all other agents communicate through BigBoss.'
   );
+}
+
+type WatchedFileMeta = {
+  path: string;
+  kind: WorkflowSessionFileKind;
+  developerName?: string;
+};
+
+function normalizeError(
+  error: unknown,
+  context: { scope?: string; path?: string } = {},
+): WorkflowSessionErrorEvent {
+  if (error instanceof Error) {
+    return {
+      message: error.message,
+      name: error.name,
+      stack: error.stack,
+      scope: context.scope,
+      path: context.path,
+      timestamp: new Date().toISOString(),
+    };
+  }
+
+  return {
+    message: String(error),
+    scope: context.scope,
+    path: context.path,
+    timestamp: new Date().toISOString(),
+  };
+}
+
+export class WorkflowSession extends EventEmitter<WorkflowSessionEvents> {
+  private readonly config: WorkflowConfig;
+  private resolved?: ResolvedWorkflowConfig;
+  private project?: ProjectRecord;
+  private taskContext?: TaskContext;
+  private prompt?: string;
+  private server?: MCPServerStdio;
+  private runner?: Runner;
+  private developerContexts: DeveloperContext[] = [];
+  private watchers: FSWatcher[] = [];
+  private runnerCleanup?: () => void;
+  private running = false;
+  private stopRequested = false;
+
+  constructor(config: WorkflowConfig) {
+    super();
+    this.config = config;
+  }
+
+  isRunning(): boolean {
+    return this.running;
+  }
+
+  getDevelopers(): WorkflowSessionDeveloper[] {
+    return this.developerContexts.map((ctx) => ({
+      name: ctx.definition.name,
+      description: ctx.definition.description ?? DEFAULT_DEVELOPER_DESCRIPTION,
+      branch: ctx.branch,
+      worktreePath: ctx.worktreePath,
+      taskFile: ctx.taskFile,
+      statusFile: ctx.statusFile,
+      handoffToken: ctx.handoffToken,
+    }));
+  }
+
+  async run(task?: string): Promise<unknown> {
+    if (this.running) {
+      throw new Error('Workflow session is already running.');
+    }
+
+    this.running = true;
+    this.stopRequested = false;
+
+    let registry: CoordinatorRegistry | undefined;
+
+    try {
+      this.emitStatus('preparing', 'Preparing workflow configuration');
+
+      const bootstrap = bootstrapWorkflow(this.config, task);
+      registry = bootstrap.registry;
+      this.resolved = bootstrap.resolved;
+      this.project = bootstrap.project;
+      this.taskContext = bootstrap.taskContext;
+      this.prompt = bootstrap.prompt;
+      this.developerContexts = bootstrap.developerContexts;
+
+      this.emitDevelopers(this.developerContexts);
+      await this.setupFileWatchers(bootstrap.resolved, this.developerContexts);
+
+      registry.close();
+      registry = undefined;
+
+      this.emitStatus('starting', 'Launching Codex MCP server');
+
+      this.server = new MCPServerStdio({
+        command: bootstrap.resolved.codexCommand,
+        args: bootstrap.resolved.codexArgs,
+        cwd: bootstrap.resolved.repoRoot,
+        clientSessionTimeoutSeconds: bootstrap.resolved.clientSessionTimeoutSeconds,
+      });
+
+      await this.server.connect();
+
+      try {
+        const { bigBoss, pmAgent, developerAgents } = buildAgents(
+          this.server,
+          bootstrap.resolved,
+          bootstrap.project,
+          bootstrap.taskContext,
+          this.developerContexts,
+        );
+
+        this.runner = new Runner();
+        this.attachRunnerListeners(this.runner);
+
+        this.emitStatus('running', 'Workflow running');
+
+        const result = await this.runner.run(bigBoss, bootstrap.prompt, {
+          maxTurns: bootstrap.resolved.maxTurns,
+        });
+
+        for (const developer of developerAgents) {
+          developer.handoffs = [pmAgent];
+        }
+        pmAgent.handoffs = [bigBoss, ...developerAgents];
+        bigBoss.handoffs = [pmAgent];
+
+        this.emit('result', result);
+        const finalStage: WorkflowSessionStage = this.stopRequested ? 'cancelled' : 'completed';
+        this.emitStatus(
+          finalStage,
+          finalStage === 'completed' ? 'Workflow completed successfully' : 'Workflow cancelled',
+        );
+        return result;
+      } finally {
+        this.detachRunnerListeners();
+        if (this.server) {
+          try {
+            await this.server.close();
+          } catch (error) {
+            this.emit('error', normalizeError(error, { scope: 'session' }));
+          } finally {
+            this.server = undefined;
+          }
+        }
+      }
+    } catch (error) {
+      const normalized = normalizeError(error, { scope: 'session' });
+      this.emit('error', normalized);
+      this.emitStatus('failed', normalized.message);
+      throw error;
+    } finally {
+      if (registry) {
+        registry.close();
+      }
+      await this.teardownWatchers();
+      this.runner = undefined;
+      this.running = false;
+    }
+  }
+
+  async stop(): Promise<void> {
+    this.stopRequested = true;
+    const runner = this.runner as unknown as {
+      abort?: () => unknown;
+      stop?: () => unknown;
+      terminate?: () => unknown;
+    };
+
+    const methods: (keyof typeof runner)[] = ['abort', 'stop', 'terminate'];
+    for (const method of methods) {
+      const fn = runner?.[method];
+      if (typeof fn === 'function') {
+        try {
+          const result = fn.call(runner);
+          if (result instanceof Promise) {
+            await result;
+          }
+        } catch (error) {
+          this.emit('error', normalizeError(error, { scope: 'runner' }));
+        }
+        break;
+      }
+    }
+  }
+
+  private emitStatus(stage: WorkflowSessionStage, message?: string): void {
+    this.emit('session-status', {
+      stage,
+      message,
+      timestamp: new Date().toISOString(),
+    });
+  }
+
+  private emitDevelopers(contexts: DeveloperContext[]): void {
+    this.emit(
+      'developers',
+      contexts.map((ctx) => ({
+        name: ctx.definition.name,
+        description: ctx.definition.description ?? DEFAULT_DEVELOPER_DESCRIPTION,
+        branch: ctx.branch,
+        worktreePath: ctx.worktreePath,
+        taskFile: ctx.taskFile,
+        statusFile: ctx.statusFile,
+        handoffToken: ctx.handoffToken,
+      })),
+    );
+  }
+
+  private async setupFileWatchers(
+    config: ResolvedWorkflowConfig,
+    contexts: DeveloperContext[],
+  ): Promise<void> {
+    const metas: WatchedFileMeta[] = [];
+
+    for (const context of contexts) {
+      metas.push({
+        path: context.taskFile,
+        kind: 'task',
+        developerName: context.definition.name,
+      });
+      metas.push({
+        path: context.statusFile,
+        kind: 'status',
+        developerName: context.definition.name,
+      });
+    }
+
+    metas.push({
+      path: join(config.repoRoot, 'PROJECT_OVERVIEW.md'),
+      kind: 'overview',
+    });
+    metas.push({
+      path: join(config.repoRoot, 'TEAM_STATUS.md'),
+      kind: 'team',
+    });
+
+    const watchers = await Promise.all(metas.map(async (meta) => this.createWatcher(meta)));
+    this.watchers = watchers.filter((watcher): watcher is FSWatcher => Boolean(watcher));
+  }
+
+  private async createWatcher(meta: WatchedFileMeta): Promise<FSWatcher | undefined> {
+    try {
+      const watcher = chokidar.watch(meta.path, {
+        ignoreInitial: false,
+        awaitWriteFinish: {
+          stabilityThreshold: 100,
+          pollInterval: 50,
+        },
+      });
+
+      watcher.on('add', () => {
+        void this.emitFileSnapshot(meta, true);
+      });
+      watcher.on('change', () => {
+        void this.emitFileSnapshot(meta, true);
+      });
+      watcher.on('unlink', () => {
+        void this.emitFileSnapshot(meta, false);
+      });
+      watcher.on('error', (watchError) => {
+        this.emit('error', normalizeError(watchError, { scope: 'watcher', path: meta.path }));
+      });
+
+      await new Promise<void>((resolve) => {
+        let resolved = false;
+        const finish = () => {
+          if (!resolved) {
+            resolved = true;
+            resolve();
+          }
+        };
+        watcher.once('ready', finish);
+        watcher.once('error', finish);
+      });
+
+      return watcher;
+    } catch (error) {
+      this.emit('error', normalizeError(error, { scope: 'watcher', path: meta.path }));
+      return undefined;
+    }
+  }
+
+  private async emitFileSnapshot(meta: WatchedFileMeta, exists: boolean): Promise<void> {
+    if (!exists) {
+      this.emit('file-update', {
+        kind: meta.kind,
+        path: meta.path,
+        developerName: meta.developerName,
+        content: null,
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    try {
+      const content = await readFile(meta.path, 'utf8');
+      this.emit('file-update', {
+        kind: meta.kind,
+        path: meta.path,
+        developerName: meta.developerName,
+        content,
+        timestamp: new Date().toISOString(),
+      });
+    } catch (error) {
+      this.emit('error', normalizeError(error, { scope: 'watcher', path: meta.path }));
+    }
+  }
+
+  private async teardownWatchers(): Promise<void> {
+    if (!this.watchers.length) {
+      return;
+    }
+
+    await Promise.all(
+      this.watchers.map(async (watcher) => {
+        try {
+          await watcher.close();
+        } catch (error) {
+          this.emit('error', normalizeError(error, { scope: 'watcher' }));
+        }
+      }),
+    );
+
+    this.watchers = [];
+  }
+
+  private attachRunnerListeners(runner: Runner): void {
+    const candidate = runner as unknown as Partial<EventEmitter> & {
+      subscribe?: (listener: (event: unknown) => void) => (() => void) | void;
+      removeListener?: (eventName: string, listener: (...args: unknown[]) => void) => void;
+    };
+
+    if (typeof candidate.on === 'function') {
+      const handler = (event: unknown) => {
+        this.emit('runner-event', {
+          event,
+          timestamp: new Date().toISOString(),
+        });
+      };
+
+      candidate.on('event' as unknown as string, handler);
+      this.runnerCleanup = () => {
+        if (typeof candidate.off === 'function') {
+          candidate.off('event' as unknown as string, handler);
+        } else if (typeof candidate.removeListener === 'function') {
+          candidate.removeListener('event' as unknown as string, handler);
+        }
+      };
+      return;
+    }
+
+    if (typeof candidate.subscribe === 'function') {
+      const unsubscribe = candidate.subscribe((event) => {
+        this.emit('runner-event', {
+          event,
+          timestamp: new Date().toISOString(),
+        });
+      });
+
+      if (typeof unsubscribe === 'function') {
+        this.runnerCleanup = () => {
+          try {
+            unsubscribe();
+          } catch (error) {
+            this.emit('error', normalizeError(error, { scope: 'runner' }));
+          }
+        };
+      }
+    }
+  }
+
+  private detachRunnerListeners(): void {
+    if (!this.runnerCleanup) {
+      return;
+    }
+
+    try {
+      this.runnerCleanup();
+    } catch (error) {
+      this.emit('error', normalizeError(error, { scope: 'runner' }));
+    } finally {
+      this.runnerCleanup = undefined;
+    }
+  }
 }

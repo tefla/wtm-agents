@@ -32,6 +32,7 @@ export type WorkflowConfig = {
   repoRoot: string;
   projectName: string;
   defaultBranch: string;
+  developers?: DeveloperDefinition[];
   model?: string;
   taskPrompt?: string;
   registryPath?: string;

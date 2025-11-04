@@ -6,16 +6,32 @@
   "description": "WTM multi-agent workflow powered by the @openai/agents SDK and Bun runtime.",
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "workflow": "bun run src/cli.ts"
+    "workflow": "bun run src/cli.ts",
+    "electron:bundle": "bunx tsup --config tsup.config.ts",
+    "electron:build": "bun run electron:bundle && bunx vite build --config electron/vite.config.ts",
+    "electron:dev": "concurrently -k -r \"bunx tsup --config tsup.config.ts --watch\" \"bunx vite --config electron/vite.config.ts\" \"wait-on tcp:5173 file:dist/electron/main.cjs && bunx cross-env ELECTRON_RENDERER_URL=http://localhost:5173 electron dist/electron/main.cjs\"",
+    "electron:preview": "bun run electron:build && bunx electron dist/electron/main.cjs"
   },
   "dependencies": {
     "@openai/agents": "^0.2.1",
+    "chokidar": "^3.6.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
     "yargs": "^18.0.0"
   },
   "devDependencies": {
+    "@types/react": "^18.3.4",
+    "@types/react-dom": "^18.3.2",
     "@types/node": "^24.10.0",
     "@types/yargs": "^17.0.34",
+    "@vitejs/plugin-react": "^4.3.2",
     "bun-types": "^1.3.1",
-    "typescript": "^5.9.3"
+    "concurrently": "^8.2.2",
+    "cross-env": "^7.0.3",
+    "electron": "^30.0.9",
+    "tsup": "^8.0.2",
+    "typescript": "^5.9.3",
+    "vite": "^5.4.1",
+    "wait-on": "^7.2.0"
   }
 }

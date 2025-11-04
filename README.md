@@ -64,4 +64,21 @@ developers are created (minimum 1).
 5. Runs the session via `Runner.run`, keeping the Project Manager in charge of
    assignments and handoffs.
 
+## Electron console
+
+A desktop dashboard is available for steering and observing the workflow:
+
+```bash
+# Install dependencies once
+bun install
+
+# Run the Electron + React dev environment
+bun run electron:dev
+```
+
+The renderer dev server (Vite) reloads automatically, while the Electron main +
+preload processes are bundled in watch mode via `tsup`. Shared agent files
+(`PROJECT_OVERVIEW.md`, `TEAM_STATUS.md`, and each developer's task/status
+documents) stream into the UI alongside the Codex runner event log.
+
 ["Building Consistent Workflows with Codex CLI & Agents SDK"]: https://cookbook.openai.com/examples/codex/codex_mcp_agents_sdk/building_consistent_workflows_codex_cli_agents_sdk

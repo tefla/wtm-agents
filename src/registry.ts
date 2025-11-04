@@ -98,9 +98,8 @@ export class CoordinatorRegistry {
       )
       .run(params.name, params.repoRoot, params.defaultBranch, now, now);
 
-    const row = this.db
-      .query<ProjectRow>(`SELECT * FROM projects WHERE name = ?`)
-      .get(params.name);
+    const projectStmt = this.db.query(`SELECT * FROM projects WHERE name = ?`);
+    const row = projectStmt.get(params.name) as ProjectRow | undefined;
     if (!row) {
       throw new Error(`Failed to load project '${params.name}' after upsert.`);
     }
@@ -108,9 +107,8 @@ export class CoordinatorRegistry {
   }
 
   findProjectByName(name: string): ProjectRecord | undefined {
-    const row = this.db
-      .query<ProjectRow>(`SELECT * FROM projects WHERE name = ?`)
-      .get(name);
+    const projectStmt = this.db.query(`SELECT * FROM projects WHERE name = ?`);
+    const row = projectStmt.get(name) as ProjectRow | undefined;
     return row ? mapProject(row) : undefined;
   }
 
@@ -130,13 +128,15 @@ export class CoordinatorRegistry {
       )
       .run(params.projectId, params.externalRef ?? null, params.title, params.pmAgent, status, now, now);
 
-    const id = this.db.query<{ id: number }>('SELECT last_insert_rowid() AS id').get()?.id;
+    const idRow = this.db.query('SELECT last_insert_rowid() AS id').get() as
+      | { id: number }
+      | undefined;
+    const id = idRow?.id;
     if (typeof id !== 'number') {
       throw new Error('Failed to retrieve inserted task id.');
     }
-    const row = this.db
-      .query<TaskRow>(`SELECT * FROM tasks WHERE id = ?`)
-      .get(id);
+    const taskStmt = this.db.query(`SELECT * FROM tasks WHERE id = ?`);
+    const row = taskStmt.get(id) as TaskRow | undefined;
     if (!row) {
       throw new Error(`Inserted task ${id} could not be loaded.`);
     }
@@ -148,9 +148,8 @@ export class CoordinatorRegistry {
     this.db
       .query(`UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?`)
       .run(status, now, taskId);
-    const row = this.db
-      .query<TaskRow>(`SELECT * FROM tasks WHERE id = ?`)
-      .get(taskId);
+    const taskStmt = this.db.query(`SELECT * FROM tasks WHERE id = ?`);
+    const row = taskStmt.get(taskId) as TaskRow | undefined;
     if (!row) {
       throw new Error(`Task ${taskId} not found while updating status.`);
     }
@@ -185,13 +184,15 @@ export class CoordinatorRegistry {
         now,
       );
 
-    const id = this.db.query<{ id: number }>('SELECT last_insert_rowid() AS id').get()?.id;
+    const idRow = this.db.query('SELECT last_insert_rowid() AS id').get() as
+      | { id: number }
+      | undefined;
+    const id = idRow?.id;
     if (typeof id !== 'number') {
       throw new Error('Failed to retrieve inserted worktree id.');
     }
-    const row = this.db
-      .query<WorktreeRow>(`SELECT * FROM worktrees WHERE id = ?`)
-      .get(id);
+    const worktreeStmt = this.db.query(`SELECT * FROM worktrees WHERE id = ?`);
+    const row = worktreeStmt.get(id) as WorktreeRow | undefined;
     if (!row) {
       throw new Error(`Inserted worktree ${id} could not be loaded.`);
     }
@@ -203,9 +204,8 @@ export class CoordinatorRegistry {
     this.db
       .query(`UPDATE worktrees SET status = ?, updated_at = ? WHERE id = ?`)
       .run(status, now, worktreeId);
-    const row = this.db
-      .query<WorktreeRow>(`SELECT * FROM worktrees WHERE id = ?`)
-      .get(worktreeId);
+    const worktreeStmt = this.db.query(`SELECT * FROM worktrees WHERE id = ?`);
+    const row = worktreeStmt.get(worktreeId) as WorktreeRow | undefined;
     if (!row) {
       throw new Error(`Worktree ${worktreeId} not found while updating status.`);
     }
@@ -213,9 +213,10 @@ export class CoordinatorRegistry {
   }
 
   listActiveWorktrees(projectId: number): WorktreeRecord[] {
-    const rows = this.db
-      .query<WorktreeRow>(`SELECT * FROM worktrees WHERE project_id = ? AND status = 'active'`)
-      .all(projectId);
+    const worktreeStmt = this.db.query(
+      `SELECT * FROM worktrees WHERE project_id = ? AND status = 'active'`,
+    );
+    const rows = worktreeStmt.all(projectId) as WorktreeRow[];
     return rows.map(mapWorktree);
   }
 
