@@ -1,10 +1,19 @@
 import { existsSync, mkdirSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { dirname, join, resolve } from 'node:path';
 
 import chokidar, { FSWatcher } from 'chokidar';
-import { Agent, MCPServerStdio, Runner } from '@openai/agents';
+import {
+  Agent,
+  MCPServerStdio,
+  RunItem,
+  RunMessageOutputItem,
+  Runner,
+  type AgentInputItem,
+  user,
+} from '@openai/agents';
 
 import {
   BIGBOSS_NAME,
@@ -21,14 +30,19 @@ import { createWorktree, GitContext, listWorktrees } from './git';
 import { CoordinatorRegistry, ProjectRecord, TaskRecord } from './registry';
 
 const DEFAULT_TASK_PROMPT = 'Coordinate the team and deliver the requested outcome.';
+const DEFAULT_CONVERSATION_PROMPT =
+  'Greet the human, summarize the projects we currently track, and offer to register a new project if needed.';
 const DEFAULT_CODEX_COMMAND = 'npx';
 const DEFAULT_CODEX_ARGS = ['-y', 'codex', 'mcp-server'];
 const DEFAULT_CLIENT_SESSION_TIMEOUT_SECONDS = 360_000;
 
 type NormalizedDeveloperDefinition = Required<DeveloperDefinition>;
 
+type WorkflowMode = 'full' | 'conversation';
+
 export type ResolvedWorkflowConfig = {
-  repoRoot: string;
+  mode: WorkflowMode;
+  repoRoot: string | null;
   projectName: string;
   defaultBranch: string;
   developers: NormalizedDeveloperDefinition[];
@@ -50,10 +64,32 @@ type WorkflowBootstrap = {
   prompt: string;
 };
 
+type Deferred<T> = {
+  promise: Promise<T>;
+  resolve: (value: T | PromiseLike<T>) => void;
+  reject: (reason?: unknown) => void;
+};
+
+function createDeferred<T>(): Deferred<T> {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+type ChatTurnOptions = {
+  announceUser?: boolean;
+  initial?: boolean;
+};
+
 export type WorkflowSessionStage =
   | 'preparing'
   | 'starting'
   | 'running'
+  | 'interactive'
   | 'completed'
   | 'failed'
   | 'cancelled';
@@ -89,6 +125,17 @@ export type WorkflowSessionRunnerEvent = {
   timestamp: string;
 };
 
+export type WorkflowSessionChatRole = 'user' | 'agent';
+
+export type WorkflowSessionChatMessage = {
+  id: string;
+  role: WorkflowSessionChatRole;
+  sender: string;
+  agentName?: string;
+  content: string;
+  timestamp: string;
+};
+
 export type WorkflowSessionErrorEvent = {
   message: string;
   name?: string;
@@ -104,6 +151,7 @@ type WorkflowSessionEvents = {
   'file-update': [WorkflowSessionFileEvent];
   'runner-event': [WorkflowSessionRunnerEvent];
   result: [unknown];
+  'chat-message': [WorkflowSessionChatMessage];
   error: [WorkflowSessionErrorEvent];
 };
 
@@ -111,38 +159,76 @@ export async function runWorkflow(
   config: WorkflowConfig,
   task?: string,
 ): Promise<unknown> {
-  const bootstrap = await bootstrapWorkflow(config, task);
-  const { resolved, registry, project, taskContext, developerContexts, prompt } = bootstrap;
+  const resolved = resolveConfig(config);
+
+  if (resolved.mode === 'full') {
+    const bootstrap = await bootstrapFullWorkflow(resolved, task);
+    const { registry, project, taskContext, developerContexts, prompt } = bootstrap;
+
+    try {
+      const server = new MCPServerStdio({
+        command: resolved.codexCommand,
+        args: resolved.codexArgs,
+        cwd: resolved.repoRoot ?? process.cwd(),
+        clientSessionTimeoutSeconds: resolved.clientSessionTimeoutSeconds,
+      });
+
+      await server.connect();
+      try {
+        const { bigBoss, pmAgent, developerAgents } = buildAgents(
+          server,
+          resolved,
+          project,
+          taskContext,
+          developerContexts,
+        );
+
+        const runner = new Runner();
+        const result = await runner.run(bigBoss, prompt, {
+          maxTurns: resolved.maxTurns,
+        });
+
+        pmAgent.handoffs = [bigBoss, ...developerAgents];
+        for (const developer of developerAgents) {
+          developer.handoffs = [pmAgent, bigBoss];
+        }
+        bigBoss.handoffs = [pmAgent];
+
+        return result;
+      } finally {
+        await server.close();
+      }
+    } finally {
+      await registry.close();
+    }
+  }
+
+  const bootstrap = await bootstrapConversationWorkflow(resolved, task);
+  const { registry, projects, prompt } = bootstrap;
 
   try {
     const server = new MCPServerStdio({
       command: resolved.codexCommand,
       args: resolved.codexArgs,
-      cwd: resolved.repoRoot,
+      cwd: resolved.repoRoot ?? process.cwd(),
       clientSessionTimeoutSeconds: resolved.clientSessionTimeoutSeconds,
     });
 
     await server.connect();
     try {
-      const { bigBoss, pmAgent, developerAgents } = buildAgents(
-        server,
-        resolved,
-        project,
-        taskContext,
-        developerContexts,
-      );
+      const bigBoss = new Agent({
+        name: BIGBOSS_NAME,
+        instructions: buildConversationInstructions(resolved, projects),
+        model: resolved.model,
+        mcpServers: [server],
+        handoffs: [],
+        handoffDescription: 'Coordinator and single user-facing agent in discovery mode.',
+      });
 
       const runner = new Runner();
       const result = await runner.run(bigBoss, prompt, {
         maxTurns: resolved.maxTurns,
       });
-
-      pmAgent.handoffs = [bigBoss, ...developerAgents];
-      for (const developer of developerAgents) {
-        developer.handoffs = [pmAgent, bigBoss];
-      }
-      bigBoss.handoffs = [pmAgent];
-
       return result;
     } finally {
       await server.close();
@@ -156,8 +242,13 @@ export async function run(config: WorkflowConfig, task?: string): Promise<unknow
   return runWorkflow(config, task);
 }
 
-async function bootstrapWorkflow(config: WorkflowConfig, task?: string): Promise<WorkflowBootstrap> {
-  const resolved = resolveConfig(config);
+async function bootstrapFullWorkflow(
+  resolved: ResolvedWorkflowConfig,
+  task?: string,
+): Promise<WorkflowBootstrap> {
+  if (!resolved.repoRoot) {
+    throw new Error('Repository root is required for a full workflow session.');
+  }
   if (!existsSync(resolved.repoRoot)) {
     throw new Error(`Repository root does not exist: ${resolved.repoRoot}`);
   }
@@ -189,12 +280,45 @@ async function bootstrapWorkflow(config: WorkflowConfig, task?: string): Promise
   }
 }
 
+type ConversationBootstrap = {
+  resolved: ResolvedWorkflowConfig;
+  registry: CoordinatorRegistry;
+  projects: ProjectRecord[];
+  prompt: string;
+};
+
+async function bootstrapConversationWorkflow(
+  resolved: ResolvedWorkflowConfig,
+  task?: string,
+): Promise<ConversationBootstrap> {
+  const registry = await CoordinatorRegistry.open({ dbPath: resolved.registryPath });
+  try {
+    const projects = await registry.listProjects();
+    const prompt = composeConversationPrompt(task, projects);
+    return {
+      resolved,
+      registry,
+      projects,
+      prompt,
+    };
+  } catch (error) {
+    await registry.close();
+    throw error;
+  }
+}
+
 function resolveConfig(config: WorkflowConfig): ResolvedWorkflowConfig {
-  const repoRoot = resolve(config.repoRoot);
+  const rawRepo = config.repoRoot?.trim() ?? '';
+  const repoRoot = rawRepo ? resolve(rawRepo) : null;
+  const mode: WorkflowMode = repoRoot ? 'full' : 'conversation';
+  const projectName = config.projectName?.trim() || (mode === 'full' ? 'Project' : 'Unassigned Project');
+  const defaultBranch = config.defaultBranch?.trim() || 'main';
+
   return {
+    mode,
     repoRoot,
-    projectName: config.projectName,
-    defaultBranch: config.defaultBranch,
+    projectName,
+    defaultBranch,
     developers: buildDeveloperDefinitions(config.developers),
     model: config.model ?? DEFAULT_MODEL,
     taskPrompt: config.taskPrompt ?? DEFAULT_TASK_PROMPT,
@@ -207,12 +331,12 @@ function resolveConfig(config: WorkflowConfig): ResolvedWorkflowConfig {
   };
 }
 
-function resolveRegistryPath(customPath: string | undefined, repoRoot: string): string {
+function resolveRegistryPath(customPath: string | undefined, repoRoot: string | null): string {
   if (customPath && customPath.trim()) {
     return resolve(customPath.trim());
   }
   const home = process.env.HOME;
-  const base = home && home.trim() ? home : repoRoot;
+  const base = home && home.trim() ? home : repoRoot ?? process.cwd();
   return resolve(base, '.agent_hub', 'bigboss.db');
 }
 
@@ -252,6 +376,10 @@ async function prepareDevelopers(
   task: TaskContext,
   registry: CoordinatorRegistry,
 ): Promise<DeveloperContext[]> {
+  if (!config.repoRoot) {
+    throw new Error('Developer preparation requires a repository root.');
+  }
+
   const gitContext: GitContext = { repoRoot: config.repoRoot };
   const contexts: DeveloperContext[] = [];
   let worktrees = listWorktrees(gitContext);
@@ -374,6 +502,10 @@ function buildCoordinatorInstructions(
   task: TaskContext,
   developers: DeveloperContext[],
 ): string {
+  if (!config.repoRoot) {
+    throw new Error('Coordinator instructions require a repository root.');
+  }
+
   const roster = developers
     .map((ctx) => {
       return [
@@ -414,6 +546,10 @@ function buildPmInstructions(
   task: TaskContext,
   developers: DeveloperContext[],
 ): string {
+  if (!config.repoRoot) {
+    throw new Error('PM instructions require a repository root.');
+  }
+
   const developerOverview = developers
     .map((ctx) => `- ${ctx.definition.name}: \`${ctx.worktreePath}\` (branch \`${ctx.branch}\`)`)
     .join('\n');
@@ -466,6 +602,10 @@ function composePrompt(
   taskContext: TaskContext,
   developers: DeveloperContext[],
 ): string {
+  if (!config.repoRoot) {
+    throw new Error('Workflow prompt composition requires a repository root.');
+  }
+
   const developerSummary = developers
     .map((ctx) => `- ${ctx.definition.name}: branch \`${ctx.branch}\`, worktree \`${ctx.worktreePath}\``)
     .join('\n');
@@ -482,6 +622,57 @@ function composePrompt(
     developerSummary +
     '\n\nBigBoss is the sole user-facing agent; all other agents communicate through BigBoss.'
   );
+}
+
+function buildConversationInstructions(
+  config: ResolvedWorkflowConfig,
+  projects: ProjectRecord[],
+): string {
+  const projectLines = formatProjectsForInstructions(projects);
+
+  return (
+    `You are ${BIGBOSS_NAME}, the coordinator and single user-facing agent.` +
+    `\n- Registry database: ${config.registryPath}` +
+    `\n- Mode: Discovery (no active project assigned yet)` +
+    '\n\nResponsibilities:\n' +
+    '1. Welcome the human and understand what they need help with.\n' +
+    '2. Surface the list of registered projects along with their repository roots.\n' +
+    '3. If the human wants to work on an existing project, clarify the project name and confirm the repository path.\n' +
+    '4. If the human wants to onboard a new project, describe the expected repository root and ask them to use the “Set Repository” button in the app header to configure it.\n' +
+    '5. Give concise, actionable instructions for any next steps the human should take in the UI.' +
+    '\n\nRegistered projects:\n' +
+    (projectLines || '- No projects registered yet. Offer to set one up by selecting a git repository path.') +
+    '\n\nGuidance:\n' +
+    '- When asking for a new repository, remind the human to use the “Set Repository” button in the header and wait for confirmation before continuing.\n' +
+    '- Do not assume a repository path if the human has not provided one.'
+  );
+}
+
+function composeConversationPrompt(
+  task: string | undefined,
+  projects: ProjectRecord[],
+): string {
+  const desired = task?.trim() || DEFAULT_CONVERSATION_PROMPT;
+  const summary = formatProjectsForPrompt(projects);
+  return `${desired}\n\nRegistry summary:\n${summary}`;
+}
+
+function formatProjectsForInstructions(projects: ProjectRecord[]): string {
+  if (!projects.length) {
+    return '';
+  }
+  return projects
+    .map((project) => `- ${project.name}: ${project.repoRoot} (default branch ${project.defaultBranch})`)
+    .join('\n');
+}
+
+function formatProjectsForPrompt(projects: ProjectRecord[]): string {
+  if (!projects.length) {
+    return 'No registered projects found.';
+  }
+  return projects
+    .map((project) => `${project.name} → ${project.repoRoot} (default ${project.defaultBranch})`)
+    .join('\n');
 }
 
 type WatchedFileMeta = {
@@ -521,11 +712,21 @@ export class WorkflowSession extends EventEmitter<WorkflowSessionEvents> {
   private prompt?: string;
   private server?: MCPServerStdio;
   private runner?: Runner;
+  private registry?: CoordinatorRegistry;
   private developerContexts: DeveloperContext[] = [];
   private watchers: FSWatcher[] = [];
   private runnerCleanup?: () => void;
   private running = false;
   private stopRequested = false;
+  private chatHistory: AgentInputItem[] = [];
+  private chatConversationId: string | null = null;
+  private chatQueue: Promise<void> = Promise.resolve();
+  private lastResponseId?: string;
+  private bigBossAgent?: Agent;
+  private pmAgent?: Agent;
+  private developerAgents: Agent[] = [];
+  private activeTurnCount = 0;
+  private sessionDeferred?: Deferred<unknown>;
 
   constructor(config: WorkflowConfig) {
     super();
@@ -555,97 +756,157 @@ export class WorkflowSession extends EventEmitter<WorkflowSessionEvents> {
 
     this.running = true;
     this.stopRequested = false;
+    this.chatQueue = Promise.resolve();
+    this.chatHistory = [];
+    this.chatConversationId = randomUUID();
+    this.lastResponseId = undefined;
+    this.activeTurnCount = 0;
+    this.sessionDeferred = createDeferred<unknown>();
 
-    let registry: CoordinatorRegistry | undefined;
+    const resolved = resolveConfig(this.config);
+    this.resolved = resolved;
 
     try {
-      this.emitStatus('preparing', 'Preparing workflow configuration');
+      const preparingMessage =
+        resolved.mode === 'full'
+          ? 'Preparing workflow configuration'
+          : 'Loading registered projects';
+      this.emitStatus('preparing', preparingMessage);
 
-      const bootstrap = await bootstrapWorkflow(this.config, task);
-      registry = bootstrap.registry;
-      this.resolved = bootstrap.resolved;
-      this.project = bootstrap.project;
-      this.taskContext = bootstrap.taskContext;
-      this.prompt = bootstrap.prompt;
-      this.developerContexts = bootstrap.developerContexts;
-
-      this.emitDevelopers(this.developerContexts);
-      await this.setupFileWatchers(bootstrap.resolved, this.developerContexts);
-
-      await registry.close();
-      registry = undefined;
-
-      this.emitStatus('starting', 'Launching Codex MCP server');
-
-      this.server = new MCPServerStdio({
-        command: bootstrap.resolved.codexCommand,
-        args: bootstrap.resolved.codexArgs,
-        cwd: bootstrap.resolved.repoRoot,
-        clientSessionTimeoutSeconds: bootstrap.resolved.clientSessionTimeoutSeconds,
-      });
-
-      await this.server.connect();
-
-      try {
-        const { bigBoss, pmAgent, developerAgents } = buildAgents(
-          this.server,
-          bootstrap.resolved,
-          bootstrap.project,
-          bootstrap.taskContext,
-          this.developerContexts,
-        );
-
-        this.runner = new Runner();
-        this.attachRunnerListeners(this.runner);
-
-        this.emitStatus('running', 'Workflow running');
-
-        const result = await this.runner.run(bigBoss, bootstrap.prompt, {
-          maxTurns: bootstrap.resolved.maxTurns,
-        });
-
-        for (const developer of developerAgents) {
-          developer.handoffs = [pmAgent];
-        }
-        pmAgent.handoffs = [bigBoss, ...developerAgents];
-        bigBoss.handoffs = [pmAgent];
-
-        this.emit('result', result);
-        const finalStage: WorkflowSessionStage = this.stopRequested ? 'cancelled' : 'completed';
-        this.emitStatus(
-          finalStage,
-          finalStage === 'completed' ? 'Workflow completed successfully' : 'Workflow cancelled',
-        );
-        return result;
-      } finally {
-        this.detachRunnerListeners();
-        if (this.server) {
-          try {
-            await this.server.close();
-          } catch (error) {
-            this.emit('error', normalizeError(error, { scope: 'session' }));
-          } finally {
-            this.server = undefined;
-          }
-        }
+      if (resolved.mode === 'full') {
+        return await this.startFullWorkflow(resolved, task);
       }
+
+      return await this.startConversationWorkflow(resolved, task);
     } catch (error) {
       const normalized = normalizeError(error, { scope: 'session' });
       this.emit('error', normalized);
-      this.emitStatus('failed', normalized.message);
+      if (this.sessionDeferred) {
+        this.sessionDeferred.reject(error);
+        this.sessionDeferred = undefined;
+      }
+      if (!this.stopRequested) {
+        this.emitStatus('failed', normalized.message);
+      }
       throw error;
     } finally {
-      if (registry) {
-        await registry.close();
-      }
-      await this.teardownWatchers();
-      this.runner = undefined;
-      this.running = false;
+      await this.cleanup();
     }
   }
 
+  private async startFullWorkflow(
+    resolved: ResolvedWorkflowConfig,
+    task?: string,
+  ): Promise<unknown> {
+    const bootstrap = await bootstrapFullWorkflow(resolved, task);
+
+    this.registry = bootstrap.registry;
+    this.project = bootstrap.project;
+    this.taskContext = bootstrap.taskContext;
+    this.prompt = bootstrap.prompt;
+    this.developerContexts = bootstrap.developerContexts;
+
+    this.emitDevelopers(this.developerContexts);
+    await this.setupFileWatchers(resolved, this.developerContexts);
+
+    this.emitStatus('starting', 'Launching Codex MCP server');
+
+    const repoRoot = resolved.repoRoot ?? process.cwd();
+    this.server = new MCPServerStdio({
+      command: resolved.codexCommand,
+      args: resolved.codexArgs,
+      cwd: repoRoot,
+      clientSessionTimeoutSeconds: resolved.clientSessionTimeoutSeconds,
+    });
+
+    await this.server.connect();
+
+    const { bigBoss, pmAgent, developerAgents } = buildAgents(
+      this.server,
+      resolved,
+      bootstrap.project,
+      bootstrap.taskContext,
+      this.developerContexts,
+    );
+
+    for (const developer of developerAgents) {
+      developer.handoffs = [pmAgent];
+    }
+    pmAgent.handoffs = [bigBoss, ...developerAgents];
+    bigBoss.handoffs = [pmAgent];
+
+    this.bigBossAgent = bigBoss;
+    this.pmAgent = pmAgent;
+    this.developerAgents = developerAgents;
+
+    this.runner = new Runner();
+    this.attachRunnerListeners(this.runner);
+
+    this.emitStatus('running', 'Workflow running');
+
+    void this.enqueueChatTurn(bootstrap.prompt, { announceUser: true, initial: true });
+
+    const deferred = this.sessionDeferred;
+    return await (deferred ? deferred.promise : Promise.resolve(undefined));
+  }
+
+  private async startConversationWorkflow(
+    resolved: ResolvedWorkflowConfig,
+    task?: string,
+  ): Promise<unknown> {
+    const bootstrap = await bootstrapConversationWorkflow(resolved, task);
+
+    this.registry = bootstrap.registry;
+    this.project = undefined;
+    this.taskContext = undefined;
+    this.prompt = bootstrap.prompt;
+    this.developerContexts = [];
+
+    this.emitDevelopers([]);
+
+    this.emitStatus('starting', 'Launching Codex MCP server');
+
+    const cwd = resolved.repoRoot ?? process.cwd();
+    this.server = new MCPServerStdio({
+      command: resolved.codexCommand,
+      args: resolved.codexArgs,
+      cwd,
+      clientSessionTimeoutSeconds: resolved.clientSessionTimeoutSeconds,
+    });
+
+    await this.server.connect();
+
+    const bigBoss = new Agent({
+      name: BIGBOSS_NAME,
+      instructions: buildConversationInstructions(resolved, bootstrap.projects),
+      model: resolved.model,
+      mcpServers: [this.server],
+      handoffs: [],
+      handoffDescription: 'Coordinator and single user-facing agent in discovery mode.',
+    });
+
+    this.bigBossAgent = bigBoss;
+    this.pmAgent = undefined;
+    this.developerAgents = [];
+
+    this.runner = new Runner();
+    this.attachRunnerListeners(this.runner);
+
+    this.emitStatus('interactive', 'Awaiting input');
+
+    void this.enqueueChatTurn(bootstrap.prompt, { announceUser: false, initial: true });
+
+    const deferred = this.sessionDeferred;
+    return await (deferred ? deferred.promise : Promise.resolve(undefined));
+  }
+
   async stop(): Promise<void> {
+    if (!this.running) {
+      return;
+    }
+
     this.stopRequested = true;
+
     const runner = this.runner as unknown as {
       abort?: () => unknown;
       stop?: () => unknown;
@@ -667,6 +928,228 @@ export class WorkflowSession extends EventEmitter<WorkflowSessionEvents> {
         break;
       }
     }
+
+    if (this.sessionDeferred) {
+      this.sessionDeferred.resolve(undefined);
+      this.sessionDeferred = undefined;
+    }
+
+    this.emitStatus('cancelled', 'Workflow stopped by user');
+  }
+
+  async sendChatMessage(message: string): Promise<void> {
+    if (!this.running || !this.sessionDeferred) {
+      throw new Error('Workflow session is not active.');
+    }
+
+    const trimmed = message.trim();
+    if (!trimmed) {
+      return;
+    }
+
+    await this.enqueueChatTurn(trimmed, { announceUser: true });
+  }
+
+  private enqueueChatTurn(message: string, options?: ChatTurnOptions): Promise<void> {
+    if (this.stopRequested) {
+      return Promise.resolve();
+    }
+
+    const trimmed = message.trim();
+    if (!trimmed) {
+      return Promise.resolve();
+    }
+
+    const runTurn = async () => {
+      if (this.stopRequested) {
+        return;
+      }
+      await this.executeChatTurn(trimmed, options);
+    };
+
+    const next = this.chatQueue.then(runTurn);
+    this.chatQueue = next.then(
+      () => undefined,
+      (error) => {
+        this.handleChatError(error);
+        return undefined;
+      },
+    );
+
+    return next;
+  }
+
+  private async executeChatTurn(message: string, options?: ChatTurnOptions): Promise<void> {
+    const runner = this.runner;
+    const agent = this.bigBossAgent;
+    if (!runner || !agent) {
+      throw new Error('Workflow session is not ready for chat turns.');
+    }
+
+    const timestamp = new Date().toISOString();
+
+    if (options?.announceUser !== false) {
+      this.emitChatMessage({
+        id: randomUUID(),
+        role: 'user',
+        sender: 'You',
+        content: message,
+        timestamp,
+      });
+    }
+
+    const userMessage = user(message);
+    const conversationInput: AgentInputItem[] = [...this.chatHistory, userMessage];
+
+    this.activeTurnCount += 1;
+    this.emitStatus('running', options?.initial ? 'Workflow running' : 'Processing input');
+
+    try {
+      const result = await runner.run(agent, conversationInput, {
+        maxTurns: this.resolved?.maxTurns,
+        conversationId: this.chatConversationId ?? undefined,
+        previousResponseId: this.lastResponseId,
+      });
+
+      this.chatHistory = result.history;
+      this.lastResponseId = result.lastResponseId;
+
+      this.emitAgentMessagesFromRunItems(result.newItems);
+
+      if (typeof result.finalOutput !== 'undefined') {
+        this.emit('result', result.finalOutput);
+      }
+    } catch (error) {
+      if (this.stopRequested) {
+        return;
+      }
+      throw error;
+    } finally {
+      this.activeTurnCount = Math.max(0, this.activeTurnCount - 1);
+      if (!this.stopRequested && this.activeTurnCount === 0) {
+        this.emitStatus('interactive', 'Awaiting further input');
+      }
+    }
+  }
+
+  private emitChatMessage(message: WorkflowSessionChatMessage): void {
+    this.emit('chat-message', message);
+  }
+
+  private emitAgentMessagesFromRunItems(items: RunItem[]): void {
+    for (const item of items) {
+      if (!this.isMessageOutputItem(item)) {
+        continue;
+      }
+
+      const content = this.extractMessageText(item);
+      if (!content) {
+        continue;
+      }
+
+      this.emitChatMessage({
+        id: randomUUID(),
+        role: 'agent',
+        sender: item.agent.name,
+        agentName: item.agent.name,
+        content,
+        timestamp: new Date().toISOString(),
+      });
+    }
+  }
+
+  private isMessageOutputItem(item: RunItem): item is RunMessageOutputItem {
+    return (item as RunMessageOutputItem)?.type === 'message_output_item';
+  }
+
+  private extractMessageText(item: RunMessageOutputItem): string | null {
+    const segments = item.rawItem?.content ?? [];
+    const parts = segments
+      .map((segment) => {
+        switch (segment.type) {
+          case 'output_text':
+            return segment.text;
+          case 'refusal':
+            return segment.refusal;
+          case 'audio':
+            return segment.transcript ?? '[Audio output]';
+          default:
+            if ('text' in segment && typeof (segment as { text?: unknown }).text === 'string') {
+              return (segment as { text: string }).text;
+            }
+            return '';
+        }
+      })
+      .map((part) => part.trim())
+      .filter((part) => part.length > 0);
+
+    if (parts.length === 0) {
+      return null;
+    }
+
+    return parts.join('\n\n');
+  }
+
+  private handleChatError(error: unknown): void {
+    if (this.stopRequested) {
+      return;
+    }
+
+    this.stopRequested = true;
+
+    const normalized = normalizeError(error, { scope: 'runner' });
+    this.emit('error', normalized);
+    this.emitStatus('failed', normalized.message);
+
+    if (this.sessionDeferred) {
+      this.sessionDeferred.reject(error);
+      this.sessionDeferred = undefined;
+    }
+  }
+
+  private async cleanup(): Promise<void> {
+    this.detachRunnerListeners();
+    this.runner = undefined;
+
+    if (this.server) {
+      try {
+        await this.server.close();
+      } catch (error) {
+        this.emit('error', normalizeError(error, { scope: 'session' }));
+      } finally {
+        this.server = undefined;
+      }
+    }
+
+    if (this.registry) {
+      try {
+        await this.registry.close();
+      } catch (error) {
+        this.emit('error', normalizeError(error, { scope: 'registry' }));
+      } finally {
+        this.registry = undefined;
+      }
+    }
+
+    await this.teardownWatchers();
+
+    this.bigBossAgent = undefined;
+    this.pmAgent = undefined;
+    this.developerAgents = [];
+    this.developerContexts = [];
+    this.project = undefined;
+    this.taskContext = undefined;
+    this.prompt = undefined;
+    this.resolved = undefined;
+
+    this.chatHistory = [];
+    this.chatConversationId = null;
+    this.chatQueue = Promise.resolve();
+    this.lastResponseId = undefined;
+    this.activeTurnCount = 0;
+    this.sessionDeferred = undefined;
+    this.stopRequested = false;
+    this.running = false;
   }
 
   private emitStatus(stage: WorkflowSessionStage, message?: string): void {
@@ -696,6 +1179,10 @@ export class WorkflowSession extends EventEmitter<WorkflowSessionEvents> {
     config: ResolvedWorkflowConfig,
     contexts: DeveloperContext[],
   ): Promise<void> {
+    if (!config.repoRoot) {
+      return;
+    }
+
     const metas: WatchedFileMeta[] = [];
 
     for (const context of contexts) {
